@@ -67,8 +67,9 @@ constexpr int kCalloutHeight = 168;
 constexpr int kCalloutSingleRowHeight = 112;
 constexpr int kSettingsRowHeight = 52;
 constexpr int kSettingsHeader = 48;
-constexpr int kSettingsExtra = 156;
+constexpr int kSettingsExtra = 200;
 constexpr int kSettingsFooter = 56;
+constexpr int kFormSheetHeight = 168;
 constexpr int kDefaultRefreshIntervalSeconds = 300;
 constexpr float kDefaultUiScale = 1.0f;
 constexpr int kKindCount = 5;
@@ -103,6 +104,7 @@ struct ProviderState {
     long long primary_reset = 0;
     long long secondary_reset = 0;
     long long tertiary_reset = 0;
+    long long reset_refresh_attempted_at = 0;
     long long last_refresh_ms = 0;
 };
 
@@ -186,6 +188,7 @@ struct UiState {
     float press_y = 0;
     float dock_ox = static_cast<float>(kCalloutWidth + kCardGap + kTailWidth);
     float dock_oy = 0;
+    float sheet_oy = 0;
     int layout_w = kPanelWidth;
     int dock_anchor_x = 0;
     int dock_anchor_y = 0;
@@ -197,6 +200,7 @@ struct UiState {
     Rect settings_quit, settings_refresh, settings_fill_toggle;
     Rect settings_refresh_interval;
     Rect settings_scale;
+    Rect settings_time_format;
     bool confirm_open = false;
     int confirm_index = -1;
     Rect confirm_cancel, confirm_delete;
@@ -211,6 +215,7 @@ struct UiState {
     float card_y_anim = 0;
     float draw_opacity = 1.0f;
     float ui_scale = kDefaultUiScale;
+    bool use_24_hour = false;
     int hover_ring = -1;
     bool gear_hovered = false;
     bool pin_hovered = false;
@@ -272,6 +277,15 @@ void event_logical(SDL_Event& event, float* x, float* y) {
 float approach(float value, float target, float dt, float rate = 14.0f) {
     float t = 1.0f - std::exp(-rate * dt);
     return value + (target - value) * t;
+}
+
+float smooth_transition(float value) {
+    value = std::clamp(value, 0.0f, 1.0f);
+    return value * value * (3.0f - 2.0f * value);
+}
+
+float model_transition_progress(int index) {
+    return smooth_transition(g_ui.model_anim[index]);
 }
 
 long long now_ms() {
@@ -470,6 +484,7 @@ float snap_callout_x() {
 }
 int dock_height();
 int settings_height();
+int sheet_height();
 
 bool left_sheet_open() {
     return g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode || g_ui.confirm_open;
@@ -561,9 +576,9 @@ float callout_y_for(int index) {
 
 void left_card_geom(float* y, float* h) {
     bool sheet = left_sheet_open();
-    *h = sheet ? static_cast<float>(settings_height()) : static_cast<float>(callout_height_for(selected_provider()));
+    *h = sheet ? static_cast<float>(sheet_height()) : static_cast<float>(callout_height_for(selected_provider()));
     if (sheet) {
-        *y = 0;
+        *y = g_ui.sheet_oy;
         return;
     }
     *y = callout_y_for(selected_provider());
@@ -601,6 +616,10 @@ int settings_height() {
     return kSettingsHeader + rows * kSettingsRowHeight + kSettingsExtra + add + kSettingsFooter;
 }
 
+int sheet_height() {
+    return g_ui.api_key_mode || g_ui.oauth_code_mode ? kFormSheetHeight : settings_height();
+}
+
 std::tm localtime_portable(std::time_t t) {
     std::tm local{};
 #if defined(_WIN32)
@@ -626,8 +645,15 @@ std::string format_reset_phrase(long long reset_at) {
     out << "Resets " << std::put_time(&local, "%a, ");
     if (local.tm_mday < 10) out << local.tm_mday;
     else out << std::put_time(&local, "%d");
-    out << std::put_time(&local, " %b at %H:%M");
-    return out.str();
+    out << std::put_time(&local, g_ui.use_24_hour ? " %b at %H:%M" : " %b at %I:%M%p");
+    if (g_ui.use_24_hour) return out.str();
+    std::string result = out.str();
+    if (auto time = result.find(" at 0"); time != std::string::npos) result.erase(time + 4, 1);
+    auto am = result.find("AM");
+    if (am != std::string::npos) result.replace(am, 2, "a");
+    auto pm = result.find("PM");
+    if (pm != std::string::npos) result.replace(pm, 2, "p");
+    return result;
 }
 
 bool over_click_target(float x, float y) {
@@ -646,7 +672,7 @@ bool over_click_target(float x, float y) {
         for (int i = 0; i < kProviderCount; ++i) {
             if (contains(g_ui.settings_toggle[i], x, y) || contains(g_ui.settings_action[i], x, y)) return true;
         }
-        return contains(g_ui.settings_quit, x, y) || contains(g_ui.settings_refresh, x, y) || contains(g_ui.settings_fill_toggle, x, y) || contains(g_ui.settings_refresh_interval, x, y) || contains(g_ui.settings_scale, x, y) || contains(g_ui.callout_rect, x, y);
+        return contains(g_ui.settings_quit, x, y) || contains(g_ui.settings_refresh, x, y) || contains(g_ui.settings_fill_toggle, x, y) || contains(g_ui.settings_refresh_interval, x, y) || contains(g_ui.settings_scale, x, y) || contains(g_ui.settings_time_format, x, y) || contains(g_ui.callout_rect, x, y);
     }
     return false;
 }
@@ -740,7 +766,7 @@ void update_window_shape() {
     SDL_Rect dock{SX(dock_x()), SY(g_ui.dock_oy), std::max(1, SX(static_cast<float>(kDockWidth))), std::max(1, SY(static_cast<float>(dock_h)))};
     fill_surface_round_rect(shape, dock, std::max(1, SX(static_cast<float>(kDockRadius))), on);
     if (left_sheet_open()) {
-        float card_y = g_ui.dock_oy, card_h = static_cast<float>(settings_height());
+        float card_y = g_ui.sheet_oy, card_h = static_cast<float>(sheet_height());
         add_card(snap_callout_x(), card_y, card_h, true);
     }
     SDL_SetWindowShape(g_ui.window, shape);
@@ -784,7 +810,7 @@ void update_render_metrics(bool reload_fonts = true) {
 
 int wanted_panel_height() {
     int dock = dock_height() + static_cast<int>(std::ceil(g_ui.dock_oy));
-    if (g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode) return std::max(dock, settings_height() + static_cast<int>(std::ceil(g_ui.dock_oy)));
+    if (g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode) return std::max(dock, sheet_height() + static_cast<int>(std::ceil(g_ui.sheet_oy)));
     return dock;
 }
 
@@ -872,6 +898,10 @@ void apply_layout() {
     int dw = std::max(1, static_cast<int>(std::lround(static_cast<float>(kDockWidth) * scale)));
     int dh = std::max(1, static_cast<int>(std::lround(static_cast<float>(dock_height()) * scale)));
     int left = dsx, top = dsy, right = dsx + dw, bottom = dsy + dh;
+    SDL_DisplayID display = SDL_GetDisplayForWindow(g_ui.window);
+    SDL_Rect usable{};
+    bool has_usable = display && SDL_GetDisplayUsableBounds(display, &usable);
+    int sheet_y = dsy;
     auto include = [&](int x, int y, int w, int h) {
         left = std::min(left, x);
         top = std::min(top, y);
@@ -880,15 +910,38 @@ void apply_layout() {
     };
     if (left_sheet_open()) {
         int cw = static_cast<int>(std::lround(static_cast<float>(kCalloutWidth + kTailWidth) * scale));
-        int ch = static_cast<int>(std::lround(static_cast<float>(settings_height()) * scale));
-        include(dsx + static_cast<int>(std::lround(snap_off_x() * scale)), dsy, cw, ch);
+        int ch = static_cast<int>(std::lround(static_cast<float>(sheet_height()) * scale));
+        if (has_usable) {
+            if (ch <= usable.h) sheet_y = std::clamp(dsy, usable.y, usable.y + usable.h - ch);
+            else sheet_y = usable.y;
+        }
+        include(dsx + static_cast<int>(std::lround(snap_off_x() * scale)), sheet_y, cw, ch);
     }
     bottom = std::max(bottom, dsy + dh);
     right = std::max(right, dsx + dw);
+    if (has_usable) {
+        int width = right - left;
+        int height = bottom - top;
+        if (width <= usable.w) {
+            left = std::clamp(left, usable.x, usable.x + usable.w - width);
+            right = left + width;
+        } else {
+            left = usable.x;
+            right = usable.x + usable.w;
+        }
+        if (height <= usable.h) {
+            top = std::clamp(top, usable.y, usable.y + usable.h - height);
+            bottom = top + height;
+        } else {
+            top = usable.y;
+            bottom = usable.y + usable.h;
+        }
+    }
     int extra_left = dsx - left;
     int extra_top = dsy - top;
     g_ui.dock_ox = static_cast<float>(extra_left) / scale;
     g_ui.dock_oy = static_cast<float>(extra_top) / scale;
+    g_ui.sheet_oy = left_sheet_open() ? static_cast<float>(sheet_y - top) / scale : g_ui.dock_oy;
     g_ui.layout_w = std::max(kDockWidth, static_cast<int>(std::lround(static_cast<float>(right - left) / scale)));
     int height = std::max(dock_height() + static_cast<int>(std::lround(g_ui.dock_oy)), static_cast<int>(std::lround(static_cast<float>(bottom - top) / scale)));
     g_ui.target_height = height;
@@ -942,6 +995,7 @@ void show_panel() {
     g_ui.callout_open = false;
     g_ui.dock_ox = 0;
     g_ui.dock_oy = 0;
+    g_ui.sheet_oy = 0;
     g_ui.layout_w = kDockWidth;
     for (int i = 0; i < kProviderCount; ++i) {
         if (g_ui.model_pinned[i]) {
@@ -1116,7 +1170,14 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         auto& state = g_app.providers[provider_index];
         if (state.busy) return;
-        if (!force && state.last_refresh_ms > 0 && now_ms() - state.last_refresh_ms < static_cast<long long>(g_ui.refresh_interval_seconds) * 1000) return;
+        long long now = now_ms();
+        long long now_seconds = now / 1000;
+        long long expired_reset = 0;
+        if (state.primary_reset > 0 && state.primary_reset <= now_seconds) expired_reset = std::max(expired_reset, state.primary_reset);
+        if (state.secondary_reset > 0 && state.secondary_reset <= now_seconds) expired_reset = std::max(expired_reset, state.secondary_reset);
+        bool expired_refresh = expired_reset > 0 && state.reset_refresh_attempted_at != expired_reset;
+        if (!force && !expired_refresh && state.last_refresh_ms > 0 && now - state.last_refresh_ms < static_cast<long long>(g_ui.refresh_interval_seconds) * 1000) return;
+        if (expired_refresh) state.reset_refresh_attempted_at = expired_reset;
         operation_id = ++state.operation_id;
         state.busy = true;
         state.status = "Refreshing " + std::string(provider_label(provider_index)) + "...";
@@ -1815,6 +1876,7 @@ void draw_panel() {
     g_ui.settings_fill_toggle = {};
     g_ui.settings_refresh_interval = {};
     g_ui.settings_scale = {};
+    g_ui.settings_time_format = {};
     for (int i = 0; i < kProviderCount; ++i) {
         g_ui.model_callout_rect[i] = {};
         g_ui.model_pin_button[i] = {};
@@ -1854,9 +1916,8 @@ void draw_panel() {
         g_ui.draw_opacity = alpha / 255.0f;
         if (left_sheet_open()) {
             float card_x = snap_callout_x();
-            float card_y = g_ui.dock_oy, card_h = 0;
+            float card_y = 0, card_h = 0;
             left_card_geom(&card_y, &card_h);
-            card_y = g_ui.dock_oy;
             draw_left_card_chrome(card_x, card_y, card_h, 255);
             if (g_ui.api_key_mode) {
                 text(card_x + 18, card_y + 16, "GLM API key", 245, 245, 247, true);
@@ -1918,7 +1979,11 @@ void draw_panel() {
                 text(card_x + 18, scale_y + 8, "UI scale", 245, 245, 247, true, true);
                 g_ui.settings_scale = {card_x + 210, scale_y + 4, 100, 30};
                 button(g_ui.settings_scale, ui_scale_label(g_ui.ui_scale), true);
-                float add_y = fill_y + 128;
+                float time_y = fill_y + 128;
+                text(card_x + 18, time_y + 8, "Time format", 245, 245, 247, true, true);
+                g_ui.settings_time_format = {card_x + 210, time_y + 4, 100, 30};
+                button(g_ui.settings_time_format, g_ui.use_24_hour ? "24-hour" : "12-hour", true);
+                float add_y = fill_y + 172;
                 int hidden_n = 0;
                 for (int k = 0; k < kKindCount; ++k) {
                     if (g_app.listed[k]) continue;
@@ -1950,8 +2015,10 @@ void draw_panel() {
     } else {
         for (int i = 0; i < kProviderCount; ++i) {
             if (!g_ui.model_open[i] || g_ui.card_window[i]) continue;
-            Uint8 card_alpha = static_cast<Uint8>(std::clamp(g_ui.model_anim[i] * g_ui.left_anim, 0.0f, 1.0f) * 255.0f);
+            float transition = model_transition_progress(i);
+            Uint8 card_alpha = static_cast<Uint8>(std::clamp(transition * g_ui.left_anim, 0.0f, 1.0f) * 255.0f);
             float card_y = (model_is_snapped(i) && i == selected) ? g_ui.card_y_anim : callout_y_for(i);
+            card_y += (1.0f - transition) * 4.0f;
             draw_model_card_content(i, callout_x_for(i), card_y, states[i], selected, card_alpha, !g_ui.model_detached[i]);
         }
     }
@@ -2105,8 +2172,10 @@ void draw_card_window(int index) {
     g_ui.render_scale = std::max(1.0f, std::max(rw / logical_width, rh / logical_height));
     set_color(0, 0, 0, 0);
     SDL_RenderClear(g_ui.renderer);
-    Uint8 alpha = g_ui.dragging_model == index ? 255 : static_cast<Uint8>(std::clamp(g_ui.model_anim[index] * g_ui.left_anim, 0.0f, 1.0f) * 255.0f);
-    draw_model_card_content(index, g_ui.card_local_x[index], 0, state, selected, alpha, !callout_floating(index), !callout_floating(index) ? std::optional<bool>(tail_right) : std::nullopt);
+    float transition = g_ui.dragging_model == index ? 1.0f : model_transition_progress(index);
+    Uint8 alpha = static_cast<Uint8>(std::clamp(transition * g_ui.left_anim, 0.0f, 1.0f) * 255.0f);
+    float card_y = (1.0f - transition) * 4.0f;
+    draw_model_card_content(index, g_ui.card_local_x[index], card_y, state, selected, alpha, !callout_floating(index), !callout_floating(index) ? std::optional<bool>(tail_right) : std::nullopt);
     g_ui.card_pin_button[index] = g_ui.model_pin_button[index];
     SDL_RenderPresent(g_ui.renderer);
     g_ui.render_scale = previous_scale;
@@ -2120,7 +2189,7 @@ void draw_card_window(int index) {
 }
 
 void draw_card_windows() {
-    for (int i = 0; i < kProviderCount; ++i) draw_card_window(i);
+    for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_open[i]) draw_card_window(i);
 }
 
 void begin_card_drag(int index) {
@@ -2239,6 +2308,7 @@ void save_layout() {
     json += ",\"remain\":" + std::string(g_ui.show_remaining ? "1" : "0");
     json += ",\"refresh_seconds\":" + std::to_string(g_ui.refresh_interval_seconds);
     json += ",\"ui_scale\":" + std::to_string(g_ui.ui_scale);
+    json += ",\"time_24h\":" + std::string(g_ui.use_24_hour ? "1" : "0");
     json += "}";
     try { credential_save_named("layout", json); } catch (const std::exception&) { }
 }
@@ -2257,6 +2327,7 @@ void logout_provider(int index) {
     state.secondary_used = 0;
     state.primary_reset = 0;
     state.secondary_reset = 0;
+    state.reset_refresh_attempted_at = 0;
     state.last_refresh_ms = 0;
     if (index >= kKindCount) {
         g_app.slot_kind[index] = -1;
@@ -2297,6 +2368,7 @@ int alloc_slot(int kind, int acct = -1) {
             state = ProviderState{};
             state.primary_row = primary_row_label(i);
             state.secondary_row = secondary_row_label(i);
+            state.secondary_available = kind_of(i) != 4;
             return i;
         }
     }
@@ -2428,6 +2500,11 @@ void handle_click(float x, float y) {
             g_ui.ui_scale = next_ui_scale(g_ui.ui_scale);
             save_layout();
             apply_ui_scale();
+            return;
+        }
+        if (contains(g_ui.settings_time_format, x, y)) {
+            g_ui.use_24_hour = !g_ui.use_24_hour;
+            save_layout();
             return;
         }
         for (int k = 0; k < kKindCount; ++k) {
@@ -2676,6 +2753,7 @@ void load_layout() {
         float value = static_cast<float>(*scale);
         if (valid_ui_scale(value)) g_ui.ui_scale = value;
     }
+    if (auto time = json_number(*raw, "time_24h")) g_ui.use_24_hour = *time != 0;
     std::lock_guard<std::mutex> lock(g_app.mutex);
     for (int i = 0; i < kKindCount; ++i) {
         if (auto flag = json_number(*raw, "l" + std::to_string(i))) g_app.listed[i] = *flag != 0;
@@ -2728,6 +2806,7 @@ void init_state() {
         state.status = state.logged_in ? "Ready to refresh " + std::string(provider_label(i)) : "Not logged in";
         state.primary_row = primary_row_label(i);
         state.secondary_row = secondary_row_label(i);
+        state.secondary_available = kind_of(i) != 4;
         if (kind_of(i) == 2) {
             state.status = state.logged_in ? "Ready to refresh GLM" : "No GLM API key saved";
             state.account = state.logged_in ? "GLM API key" : "";
@@ -2819,6 +2898,7 @@ int main(int argc, char** argv) {
     }
 
     long long last_poll = now_ms();
+    long long last_expiry_poll = last_poll;
     long long last_tick = now_ms();
     while (!g_quit) {
         SDL_Event event;
@@ -2919,6 +2999,23 @@ int main(int argc, char** argv) {
             last_poll = now_ms();
             for (int i = 0; i < kProviderCount; ++i) {
                 if (provider_has_auth(i)) refresh_usage_async_for(i);
+            }
+        }
+        long long expiry_now = now_ms();
+        if (expiry_now - last_expiry_poll >= 1000) {
+            last_expiry_poll = expiry_now;
+            long long now_seconds = expiry_now / 1000;
+            for (int i = 0; i < kProviderCount; ++i) {
+                bool expired = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_app.mutex);
+                    const auto& state = g_app.providers[i];
+                    long long reset = 0;
+                    if (state.primary_reset > 0 && state.primary_reset <= now_seconds) reset = std::max(reset, state.primary_reset);
+                    if (state.secondary_reset > 0 && state.secondary_reset <= now_seconds) reset = std::max(reset, state.secondary_reset);
+                    expired = state.logged_in && !state.busy && reset > 0 && state.reset_refresh_attempted_at != reset;
+                }
+                if (expired) refresh_usage_async_for(i);
             }
         }
 

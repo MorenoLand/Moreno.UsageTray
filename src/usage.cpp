@@ -48,10 +48,19 @@ static constexpr const char* kGrokBillingUrl = "https://cli-chat-proxy.grok.com/
 static constexpr const char* kGrokSettingsUrl = "https://cli-chat-proxy.grok.com/v1/settings";
 static constexpr const char* kGrokChatUrl = "https://cli-chat-proxy.grok.com/v1/chat/completions";
 
+static long long epoch_now_seconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static long long normalize_epoch_seconds(long long value) {
+    while (value > 100000000000LL) value /= 1000;
+    return value;
+}
+
 static long long parse_iso_or_epoch_reset(const std::string& value) {
     if (value.empty()) return 0;
     if (std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isdigit(c); })) {
-        return std::stoll(value);
+        return normalize_epoch_seconds(std::stoll(value));
     }
     std::tm tm{};
     std::istringstream in(value.substr(0, 19));
@@ -177,7 +186,10 @@ static RateWindow parse_openai_window(const std::string& body, const std::string
     RateWindow window;
     window.available = true;
     window.used_percent = json_number(object, "used_percent").value_or(0);
-    if (auto reset_at = json_number(object, "reset_at")) window.reset_at = static_cast<long long>(*reset_at);
+    auto reset_after = json_number(object, "reset_after_seconds");
+    auto reset_at = json_number(object, "reset_at");
+    if (reset_after && *reset_after > 0) window.reset_at = epoch_now_seconds() + static_cast<long long>(std::llround(*reset_after));
+    else if (reset_at && *reset_at > 0) window.reset_at = normalize_epoch_seconds(static_cast<long long>(*reset_at));
     else window.reset_at = parse_iso_or_epoch_reset(json_string(object, "resets_at").value_or(""));
     if (auto limit_window_seconds = json_number(object, "limit_window_seconds")) window.limit_window_seconds = static_cast<long long>(*limit_window_seconds);
     else window.limit_window_seconds = static_cast<long long>(json_number(object, "window_minutes").value_or(0) * 60.0);
@@ -406,6 +418,15 @@ static std::string lower_ascii(std::string value) {
     return value;
 }
 
+static double grok_number(const std::string& object, const char* key, double fallback = -1) {
+    if (auto value = json_number(object, key)) return *value;
+    std::string text = json_string(object, key).value_or("");
+    if (text.empty()) return fallback;
+    char* end = nullptr;
+    double value = std::strtod(text.c_str(), &end);
+    return end == text.c_str() ? fallback : value;
+}
+
 static bool grok_product_is_cli(const std::string& product) {
     std::string lower = lower_ascii(product);
     return lower.find("build") != std::string::npos || lower == "cli";
@@ -414,6 +435,25 @@ static bool grok_product_is_cli(const std::string& product) {
 static bool grok_product_is_bot(const std::string& product) {
     std::string lower = lower_ascii(product);
     return lower.find("chat") != std::string::npos || lower.find("bot") != std::string::npos;
+}
+
+static std::string grok_product_name(const std::string& object) {
+    std::string product = json_string(object, "product").value_or("");
+    if (product.empty()) product = json_string(object, "name").value_or("");
+    if (product.empty()) product = json_string(object, "label").value_or("");
+    if (!product.empty()) return product;
+    auto id = json_number(object, "product");
+    if (!id) return "";
+    switch (static_cast<int>(*id)) {
+    case 0: return "3rd Party";
+    case 1: return "API";
+    case 2: return "Grok Build";
+    case 3: return "Grok Plugins";
+    case 4: return "Chat";
+    case 5: return "Imagine";
+    case 6: return "Voice";
+    default: return "";
+    }
 }
 
 static RateWindow grok_window(double used_percent, long long reset_at, long long window_seconds) {
@@ -441,7 +481,7 @@ static UsageInfo parse_grok_usage(const std::string& body, const std::string& pl
     std::string period_type = json_string(period, "type").value_or(json_string(body, "period").value_or(""));
     long long window_seconds = period_type.find("MONTH") != std::string::npos ? 30LL * 24 * 60 * 60 : 7LL * 24 * 60 * 60;
     bool has_period = !period.empty() || !end.empty();
-    double overall = json_number(config, "creditUsagePercent").value_or(json_number(body, "creditUsagePercent").value_or(has_period ? 0.0 : -1.0));
+    double overall = grok_number(config, "creditUsagePercent", grok_number(config, "credit_usage_percent", grok_number(body, "creditUsagePercent", grok_number(body, "credit_usage_percent", has_period ? 0.0 : -1.0))));
     std::string products = grok_array(config, body, "productUsage");
     if (products.empty()) products = grok_array(config, body, "products");
     bool cli_found = false;
@@ -449,8 +489,8 @@ static UsageInfo parse_grok_usage(const std::string& body, const std::string& pl
     double cli_used = 0;
     double bot_used = 0;
     for (const std::string& object : objects_in_array(products)) {
-        std::string product = json_string(object, "product").value_or("");
-        double used = json_number(object, "usagePercent").value_or(json_number(object, "usage_percent").value_or(0));
+        std::string product = grok_product_name(object);
+        double used = grok_number(object, "usagePercent", grok_number(object, "usage_percent", 0));
         if (grok_product_is_cli(product)) {
             cli_found = true;
             cli_used = used;
@@ -469,7 +509,8 @@ static UsageInfo parse_grok_usage(const std::string& body, const std::string& pl
     info.email = email;
     info.plan_type = plan.empty() ? "Grok" : plan;
     info.primary = grok_window(cli_found ? cli_used : (overall >= 0 ? overall : 0), reset_at, window_seconds);
-    info.secondary = grok_window(bot_found ? bot_used : 0, reset_at, window_seconds);
+    info.secondary = bot_found ? grok_window(bot_used, reset_at, window_seconds) : RateWindow{};
+    diagnostics_log("grok parsed overall=" + std::to_string(overall) + " cli_found=" + std::string(cli_found ? "true" : "false") + " cli_used=" + std::to_string(cli_used) + " bot_found=" + std::string(bot_found ? "true" : "false") + " bot_used=" + std::to_string(bot_used));
     return info;
 }
 
@@ -533,7 +574,8 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         if (settings.status >= 200 && settings.status < 300) {
             plan = json_string(settings.body, "subscription_tier_display").value_or(json_string(settings.body, "subscription_tier").value_or(plan));
         }
-        return parse_grok_usage(res.body, plan, credentials->account_id);
+        UsageInfo info = parse_grok_usage(res.body, plan, credentials->account_id);
+        return info;
     }
 
     if (kind == "gemini") {
@@ -584,11 +626,11 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         std::string seven = spos == std::string::npos ? res.body : res.body.substr(spos);
         info.primary.available = fpos != std::string::npos;
         info.primary.used_percent = json_number(five, "utilization").value_or(0);
-        if (auto n = json_number(five, "resets_at")) info.primary.reset_at = static_cast<long long>(*n);
+        if (auto n = json_number(five, "resets_at"); n && *n > 0) info.primary.reset_at = normalize_epoch_seconds(static_cast<long long>(*n));
         else info.primary.reset_at = parse_iso_or_epoch_reset(json_string(five, "resets_at").value_or(""));
         info.secondary.available = spos != std::string::npos;
         info.secondary.used_percent = json_number(seven, "utilization").value_or(0);
-        if (auto n = json_number(seven, "resets_at")) info.secondary.reset_at = static_cast<long long>(*n);
+        if (auto n = json_number(seven, "resets_at"); n && *n > 0) info.secondary.reset_at = normalize_epoch_seconds(static_cast<long long>(*n));
         else info.secondary.reset_at = parse_iso_or_epoch_reset(json_string(seven, "resets_at").value_or(""));
         return info;
     }
@@ -598,6 +640,8 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
     };
     if (!credentials->account_id.empty()) headers["ChatGPT-Account-Id"] = credentials->account_id;
     HttpResponse res = http_get(kWhamUrl, headers);
+    diagnostics_log("openai usage status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()));
+    diagnostics_log_raw("openai usage raw_body", res.body);
     if (res.status < 200 || res.status >= 300) {
         throw std::runtime_error("Usage request failed: HTTP " + std::to_string(res.status));
     }

@@ -11,7 +11,7 @@ provider's settings page.
 | Claude | Browser OAuth via Anthropic | 5 hour, weekly |
 | GLM/Z.ai | Saved API key | 5 hour quota, MCP/tool requests |
 | Gemini/Antigravity | Google OAuth with hosted verification code | 5 hour, weekly |
-| Grok | Browser OAuth via auth.x.ai (Grok CLI) | Weekly Grok CLI, weekly Grok Bot |
+| Grok | Browser OAuth via auth.x.ai (Grok CLI) | Weekly Grok CLI |
 
 ## Platform Status
 
@@ -122,7 +122,7 @@ Grok uses the public Grok CLI OAuth client against `auth.x.ai`:
 - Token endpoint: `https://auth.x.ai/oauth2/token`
 - Usage endpoint: `https://cli-chat-proxy.grok.com/v1/billing?format=credits`
 - Usage headers include `X-XAI-Token-Auth: xai-grok-cli`
-- Bars are Grok CLI (`GrokBuild`) and Grok Bot (`GrokChat`) weekly product windows from that payload
+- The bar is the Grok CLI (`GrokBuild`) weekly product window from that payload; Grok web usage is not shown without its separate browser session
 
 ## Debug
 
