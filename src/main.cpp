@@ -72,6 +72,7 @@ constexpr int kSettingsExtra = 288;
 constexpr int kSettingsFooter = 56;
 constexpr int kFormSheetHeight = 168;
 constexpr int kUpdateDialogHeight = 206;
+constexpr int kUpdateInstallingHeight = 154;
 constexpr int kDefaultRefreshIntervalSeconds = 300;
 constexpr float kDefaultUiScale = 1.0f;
 constexpr int kKindCount = 5;
@@ -231,6 +232,7 @@ struct UiState {
     bool update_dialog_open = false;
     bool update_ignore_checked = false;
     bool update_installing = false;
+    double update_progress = 0;
     std::string update_error;
     std::string update_ignored_version;
     std::string update_version;
@@ -272,6 +274,7 @@ struct UpdateInstallState {
     std::mutex mutex;
     bool in_flight = false;
     bool complete = false;
+    double progress = 0;
     std::filesystem::path staged;
     std::string error;
 };
@@ -671,7 +674,7 @@ int settings_height() {
 }
 
 int sheet_height() {
-    if (g_ui.update_dialog_open) return kUpdateDialogHeight;
+    if (g_ui.update_dialog_open) return g_ui.update_installing ? kUpdateInstallingHeight : kUpdateDialogHeight;
     return g_ui.api_key_mode || g_ui.oauth_code_mode ? kFormSheetHeight : settings_height();
 }
 
@@ -2019,6 +2022,10 @@ void draw_panel() {
                     text(card_x + 18, card_y + 16, "Updating", 245, 245, 247, true);
                     text(card_x + 18, card_y + 48, "Downloading version " + g_ui.update_version + "...", 245, 245, 247, false, true);
                     text(card_x + 18, card_y + 72, "The app will restart automatically.", 142, 142, 147, false, true);
+                    double progress = std::clamp(g_ui.update_progress, 0.0, 1.0);
+                    double track_used = g_ui.show_remaining ? 100.0 - progress * 100.0 : progress * 100.0;
+                    usage_track(card_x + 18, card_y + 96, static_cast<float>(kCalloutWidth) - 36.0f, track_used, false);
+                    text(card_x + 18, card_y + 108, std::to_string(static_cast<int>(std::round(progress * 100.0))) + "% downloaded", 174, 174, 178, false, true);
                     g_ui.update_yes = {};
                     g_ui.update_later = {};
                     g_ui.update_ignore = {};
@@ -2065,6 +2072,9 @@ void draw_panel() {
                 button(g_ui.oauth_code_cancel, "Cancel", true);
             } else if (g_ui.settings_open) {
                 text(card_x + 18, card_y + 16, "Settings", 245, 245, 247, true);
+                std::string version = "v" + std::string(LLM_USAGE_TRAY_VERSION);
+                auto version_size = measure_text(version, false, true);
+                text(card_x + static_cast<float>(kCalloutWidth) - 18.0f - version_size.first, card_y + 20, version, 104, 104, 110, false, true);
                 for (int i = 0; i < kKindCount; ++i) { g_ui.settings_add[i] = {}; g_ui.settings_add_kind[i] = {}; }
                 for (int i = 0; i < kProviderCount; ++i) g_ui.settings_remove[i] = {};
                 int row_i = 0;
@@ -2501,6 +2511,9 @@ void poll_update_check_result() {
     g_ui.update_release_url = info->release_url;
     g_ui.update_asset_url = info->asset_url;
     g_ui.update_ignore_checked = false;
+    g_ui.update_installing = false;
+    g_ui.update_progress = 0;
+    g_ui.update_error.clear();
     g_ui.settings_open = false;
     g_ui.settings_target = false;
     g_ui.confirm_open = false;
@@ -2523,14 +2536,21 @@ void start_update_install() {
         if (g_update_install.in_flight) return;
         g_update_install.in_flight = true;
         g_update_install.complete = false;
+        g_update_install.progress = 0;
         g_update_install.staged.clear();
         g_update_install.error.clear();
     }
     g_ui.update_installing = true;
+    g_ui.update_progress = 0;
     g_ui.update_error.clear();
+    set_target_height(wanted_panel_height());
+    apply_layout();
     std::thread([info] {
         try {
-            std::filesystem::path staged = download_update(info);
+            std::filesystem::path staged = download_update(info, [](double progress) {
+                std::lock_guard<std::mutex> lock(g_update_install.mutex);
+                g_update_install.progress = std::clamp(progress, 0.0, 1.0);
+            });
             std::lock_guard<std::mutex> lock(g_update_install.mutex);
             g_update_install.staged = std::move(staged);
             g_update_install.complete = true;
@@ -2550,6 +2570,7 @@ void poll_update_install_result() {
     std::string error;
     {
         std::lock_guard<std::mutex> lock(g_update_install.mutex);
+        g_ui.update_progress = std::clamp(g_update_install.progress, 0.0, 1.0);
         if (!g_update_install.complete) return;
         staged = std::move(g_update_install.staged);
         error = std::move(g_update_install.error);
@@ -2558,6 +2579,8 @@ void poll_update_install_result() {
     if (!error.empty()) {
         g_ui.update_installing = false;
         g_ui.update_error = error;
+        set_target_height(wanted_panel_height());
+        apply_layout();
         return;
     }
     if (staged.empty() || !launch_update_helper(staged, current_executable_path(), g_ui.update_sha256)) {
@@ -2565,6 +2588,8 @@ void poll_update_install_result() {
         g_ui.update_error = "Unable to start update helper";
         std::error_code cleanup_error;
         std::filesystem::remove(staged, cleanup_error);
+        set_target_height(wanted_panel_height());
+        apply_layout();
         return;
     }
     g_ui.update_dialog_open = false;
@@ -2583,6 +2608,8 @@ void finish_update_dialog(bool install) {
     }
     g_ui.update_dialog_open = false;
     g_ui.update_ignore_checked = false;
+    g_ui.update_error.clear();
+    g_ui.update_progress = 0;
     set_target_height(wanted_panel_height());
     apply_layout();
 }

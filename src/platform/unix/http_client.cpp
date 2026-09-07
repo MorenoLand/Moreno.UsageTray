@@ -13,7 +13,20 @@ size_t write_body(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return size * nmemb;
 }
 
-HttpResponse request(const std::string& method, const std::string& url, const std::map<std::string, std::string>& headers, const std::string& body) {
+struct ProgressState {
+    const HttpProgressCallback* callback = nullptr;
+};
+
+int progress_callback(void* userdata, curl_off_t total, curl_off_t now, curl_off_t, curl_off_t) {
+    auto* state = static_cast<ProgressState*>(userdata);
+    if (!state || !state->callback || !*state->callback) return 0;
+    std::size_t received = now > 0 ? static_cast<std::size_t>(now) : 0;
+    std::size_t length = total > 0 ? static_cast<std::size_t>(total) : 0;
+    (*state->callback)(received, length);
+    return 0;
+}
+
+HttpResponse request(const std::string& method, const std::string& url, const std::map<std::string, std::string>& headers, const std::string& body, const HttpProgressCallback& progress = {}) {
     CURL* curl = curl_easy_init();
     if (!curl) throw std::runtime_error("curl_easy_init failed");
 
@@ -23,6 +36,12 @@ HttpResponse request(const std::string& method, const std::string& url, const st
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "LLMUsageTray/" LLM_USAGE_TRAY_VERSION);
+    ProgressState progress_state{&progress};
+    if (progress) {
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_callback);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &progress_state);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    }
 
     struct curl_slist* header_list = nullptr;
     for (const auto& [key, value] : headers) {
@@ -67,8 +86,8 @@ std::string form_encode(const std::map<std::string, std::string>& fields) {
 
 } // namespace
 
-HttpResponse http_get(const std::string& url, const std::map<std::string, std::string>& headers) {
-    return request("GET", url, headers, "");
+HttpResponse http_get(const std::string& url, const std::map<std::string, std::string>& headers, const HttpProgressCallback& progress) {
+    return request("GET", url, headers, "", progress);
 }
 
 HttpResponse http_post_form(const std::string& url, const std::map<std::string, std::string>& fields) {

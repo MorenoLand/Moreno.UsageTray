@@ -267,13 +267,16 @@ std::optional<UpdateInfo> check_for_update() {
     return info;
 }
 
-std::filesystem::path download_update(const UpdateInfo& info) {
+std::filesystem::path download_update(const UpdateInfo& info, const UpdateProgressCallback& progress) {
     std::filesystem::path target = current_executable_path();
     std::filesystem::path staged = target;
     staged += ".update";
     std::error_code error;
     std::filesystem::remove(staged, error);
-    HttpResponse response = http_get(info.asset_url, {{"Accept", "application/octet-stream"}});
+    HttpProgressCallback http_progress = [&](std::size_t received, std::size_t total) {
+        if (progress && total > 0) progress(std::clamp(static_cast<double>(received) / static_cast<double>(total), 0.0, 1.0));
+    };
+    HttpResponse response = http_get(info.asset_url, {{"Accept", "application/octet-stream"}}, http_progress);
     diagnostics_log("update download status=" + std::to_string(response.status) + " body_length=" + std::to_string(response.body.size()));
     if (response.status < 200 || response.status >= 300) throw std::runtime_error("Update download failed: HTTP " + std::to_string(response.status));
     std::ofstream out(staged, std::ios::binary | std::ios::trunc);
@@ -281,6 +284,7 @@ std::filesystem::path download_update(const UpdateInfo& info) {
     out.write(response.body.data(), static_cast<std::streamsize>(response.body.size()));
     out.close();
     if (!out) throw std::runtime_error("Unable to write update staging file");
+    if (progress) progress(1.0);
     std::string actual = sha256_file(staged);
     if (actual.empty() || lower_ascii(actual) != lower_ascii(info.sha256)) {
         std::filesystem::remove(staged, error);

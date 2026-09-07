@@ -30,7 +30,7 @@ static std::string url_encode(const std::string& value) {
     return out;
 }
 
-static HttpResponse request(const std::string& method, const std::string& url, const std::map<std::string, std::string>& headers, const std::string& body) {
+static HttpResponse request(const std::string& method, const std::string& url, const std::map<std::string, std::string>& headers, const std::string& body, const HttpProgressCallback& progress = {}) {
     URL_COMPONENTS parts{};
     parts.dwStructSize = sizeof(parts);
     wchar_t host[256]{};
@@ -92,15 +92,23 @@ static HttpResponse request(const std::string& method, const std::string& url, c
     DWORD status = 0;
     DWORD status_size = sizeof(status);
     WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &status_size, nullptr);
+    DWORD content_length = 0;
+    DWORD content_length_size = sizeof(content_length);
+    WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &content_length, &content_length_size, nullptr);
 
     std::string response;
+    std::size_t received = 0;
+    if (progress) progress(0, content_length);
     DWORD available = 0;
     while (WinHttpQueryDataAvailable(req, &available) && available > 0) {
         std::vector<char> buffer(available);
         DWORD read = 0;
         if (!WinHttpReadData(req, buffer.data(), available, &read)) break;
         response.append(buffer.data(), read);
+        received += read;
+        if (progress) progress(received, content_length);
     }
+    if (progress) progress(received, content_length);
 
     WinHttpCloseHandle(req);
     WinHttpCloseHandle(connect);
@@ -108,8 +116,8 @@ static HttpResponse request(const std::string& method, const std::string& url, c
     return { static_cast<int>(status), response };
 }
 
-HttpResponse http_get(const std::string& url, const std::map<std::string, std::string>& headers) {
-    return request("GET", url, headers, "");
+HttpResponse http_get(const std::string& url, const std::map<std::string, std::string>& headers, const HttpProgressCallback& progress) {
+    return request("GET", url, headers, "", progress);
 }
 
 HttpResponse http_post_form(const std::string& url, const std::map<std::string, std::string>& fields) {
