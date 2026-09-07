@@ -5,6 +5,7 @@
 #include "platform.h"
 #include "usage.h"
 #include "svg_icons.h"
+#include "update.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -67,9 +68,10 @@ constexpr int kCalloutHeight = 168;
 constexpr int kCalloutSingleRowHeight = 112;
 constexpr int kSettingsRowHeight = 52;
 constexpr int kSettingsHeader = 48;
-constexpr int kSettingsExtra = 200;
+constexpr int kSettingsExtra = 288;
 constexpr int kSettingsFooter = 56;
 constexpr int kFormSheetHeight = 168;
+constexpr int kUpdateDialogHeight = 206;
 constexpr int kDefaultRefreshIntervalSeconds = 300;
 constexpr float kDefaultUiScale = 1.0f;
 constexpr int kKindCount = 5;
@@ -170,6 +172,7 @@ struct UiState {
     Rect model_pin_button[kProviderCount];
     bool model_open[kProviderCount]{};
     bool model_pinned[kProviderCount]{};
+    bool card_raise_pending[kProviderCount]{};
     bool model_detached[kProviderCount]{};
     float model_off_x[kProviderCount]{};
     float model_off_y[kProviderCount]{};
@@ -201,6 +204,13 @@ struct UiState {
     Rect settings_refresh_interval;
     Rect settings_scale;
     Rect settings_time_format;
+    Rect settings_window_mode;
+    Rect settings_refresh_prev, settings_refresh_next;
+    Rect settings_scale_prev, settings_scale_next;
+    Rect settings_time_prev, settings_time_next;
+    Rect settings_window_prev, settings_window_next;
+    Rect settings_update_toggle, settings_check_updates;
+    Rect update_yes, update_later, update_ignore;
     bool confirm_open = false;
     int confirm_index = -1;
     Rect confirm_cancel, confirm_delete;
@@ -216,6 +226,17 @@ struct UiState {
     float draw_opacity = 1.0f;
     float ui_scale = kDefaultUiScale;
     bool use_24_hour = false;
+    bool always_on_top = true;
+    bool update_check_enabled = true;
+    bool update_dialog_open = false;
+    bool update_ignore_checked = false;
+    bool update_installing = false;
+    std::string update_error;
+    std::string update_ignored_version;
+    std::string update_version;
+    std::string update_sha256;
+    std::string update_release_url;
+    std::string update_asset_url;
     int hover_ring = -1;
     bool gear_hovered = false;
     bool pin_hovered = false;
@@ -236,6 +257,26 @@ std::atomic_bool g_quit{false};
 std::atomic_bool g_show_requested{false};
 std::atomic_bool g_refresh_requested{false};
 std::atomic_bool g_warm_requested{false};
+
+struct UpdateCheckState {
+    std::mutex mutex;
+    bool in_flight = false;
+    bool complete = false;
+    bool manual = false;
+    std::optional<UpdateInfo> info;
+};
+
+UpdateCheckState g_update_check;
+
+struct UpdateInstallState {
+    std::mutex mutex;
+    bool in_flight = false;
+    bool complete = false;
+    std::filesystem::path staged;
+    std::string error;
+};
+
+UpdateInstallState g_update_install;
 
 constexpr float kUiScaleOptions[] = {0.75f, 0.85f, 1.0f, 1.15f, 1.3f, 1.5f};
 
@@ -301,6 +342,12 @@ bool valid_ui_scale(float value) {
 float next_ui_scale(float current) {
     constexpr int count = static_cast<int>(sizeof(kUiScaleOptions) / sizeof(kUiScaleOptions[0]));
     for (int i = 0; i < count; ++i) if (std::abs(current - kUiScaleOptions[i]) < 0.001f) return kUiScaleOptions[(i + 1) % count];
+    return kDefaultUiScale;
+}
+
+float previous_ui_scale(float current) {
+    constexpr int count = static_cast<int>(sizeof(kUiScaleOptions) / sizeof(kUiScaleOptions[0]));
+    for (int i = 0; i < count; ++i) if (std::abs(current - kUiScaleOptions[i]) < 0.001f) return kUiScaleOptions[(i + count - 1) % count];
     return kDefaultUiScale;
 }
 
@@ -487,7 +534,7 @@ int settings_height();
 int sheet_height();
 
 bool left_sheet_open() {
-    return g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode || g_ui.confirm_open;
+    return g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode || g_ui.confirm_open || g_ui.update_dialog_open;
 }
 
 void request_settings(bool open) {
@@ -503,6 +550,13 @@ int next_refresh_interval(int current) {
     constexpr int options[] = {30, 45, 60, 300, 900, 1800, 3600};
     constexpr int count = static_cast<int>(sizeof(options) / sizeof(options[0]));
     for (int i = 0; i < count; ++i) if (options[i] == current) return options[(i + 1) % count];
+    return kDefaultRefreshIntervalSeconds;
+}
+
+int previous_refresh_interval(int current) {
+    constexpr int options[] = {30, 45, 60, 300, 900, 1800, 3600};
+    constexpr int count = static_cast<int>(sizeof(options) / sizeof(options[0]));
+    for (int i = 0; i < count; ++i) if (options[i] == current) return options[(i + count - 1) % count];
     return kDefaultRefreshIntervalSeconds;
 }
 
@@ -617,6 +671,7 @@ int settings_height() {
 }
 
 int sheet_height() {
+    if (g_ui.update_dialog_open) return kUpdateDialogHeight;
     return g_ui.api_key_mode || g_ui.oauth_code_mode ? kFormSheetHeight : settings_height();
 }
 
@@ -664,6 +719,7 @@ bool over_click_target(float x, float y) {
         return contains(g_ui.oauth_code_input_box, x, y) || contains(g_ui.oauth_code_ok, x, y) || contains(g_ui.oauth_code_cancel, x, y);
     }
     if (g_ui.confirm_open) return contains(g_ui.confirm_delete, x, y) || contains(g_ui.confirm_cancel, x, y);
+    if (g_ui.update_dialog_open) return contains(g_ui.update_yes, x, y) || contains(g_ui.update_later, x, y) || contains(g_ui.update_ignore, x, y);
     if (contains(g_ui.pin_button, x, y) || contains(g_ui.gear_button, x, y) || contains(g_ui.callout_pin_button, x, y)) return true;
     for (int i = 0; i < kProviderCount; ++i) {
         if (contains(g_ui.ring_slots[i], x, y) || contains(g_ui.model_pin_button[i], x, y)) return true;
@@ -672,7 +728,7 @@ bool over_click_target(float x, float y) {
         for (int i = 0; i < kProviderCount; ++i) {
             if (contains(g_ui.settings_toggle[i], x, y) || contains(g_ui.settings_action[i], x, y)) return true;
         }
-        return contains(g_ui.settings_quit, x, y) || contains(g_ui.settings_refresh, x, y) || contains(g_ui.settings_fill_toggle, x, y) || contains(g_ui.settings_refresh_interval, x, y) || contains(g_ui.settings_scale, x, y) || contains(g_ui.settings_time_format, x, y) || contains(g_ui.callout_rect, x, y);
+        return contains(g_ui.settings_quit, x, y) || contains(g_ui.settings_refresh, x, y) || contains(g_ui.settings_fill_toggle, x, y) || contains(g_ui.settings_refresh_interval, x, y) || contains(g_ui.settings_scale, x, y) || contains(g_ui.settings_time_format, x, y) || contains(g_ui.settings_window_mode, x, y) || contains(g_ui.settings_update_toggle, x, y) || contains(g_ui.settings_check_updates, x, y) || contains(g_ui.callout_rect, x, y);
     }
     return false;
 }
@@ -810,7 +866,7 @@ void update_render_metrics(bool reload_fonts = true) {
 
 int wanted_panel_height() {
     int dock = dock_height() + static_cast<int>(std::ceil(g_ui.dock_oy));
-    if (g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode) return std::max(dock, sheet_height() + static_cast<int>(std::ceil(g_ui.sheet_oy)));
+    if (g_ui.settings_open || g_ui.api_key_mode || g_ui.oauth_code_mode || g_ui.update_dialog_open) return std::max(dock, sheet_height() + static_cast<int>(std::ceil(g_ui.sheet_oy)));
     return dock;
 }
 
@@ -850,6 +906,14 @@ void set_target_height(int height, bool immediate = false) {
         SDL_SyncWindow(g_ui.window);
     }
     update_window_shape();
+}
+
+void apply_window_mode() {
+    if (g_ui.window) SDL_SetWindowAlwaysOnTop(g_ui.window, g_ui.always_on_top);
+    for (int i = 0; i < kProviderCount; ++i) if (g_ui.card_window[i]) {
+        SDL_SetWindowAlwaysOnTop(g_ui.card_window[i], g_ui.always_on_top);
+        SDL_SetWindowFocusable(g_ui.card_window[i], !g_ui.always_on_top);
+    }
 }
 
 void capture_dock_anchor() {
@@ -972,6 +1036,8 @@ void close_menus() {
     request_settings(false);
     g_ui.confirm_open = false;
     g_ui.confirm_index = -1;
+    g_ui.update_dialog_open = false;
+    g_ui.update_ignore_checked = false;
     for (int i = 0; i < kProviderCount; ++i) {
         if (g_ui.model_open[i] && !g_ui.model_pinned[i]) {
             g_ui.model_open[i] = false;
@@ -983,6 +1049,7 @@ void close_menus() {
 }
 
 void show_panel() {
+    if (g_ui.update_installing) return;
     g_show_requested = false;
     capture_pinned_card_positions();
     g_ui.visible = true;
@@ -992,6 +1059,8 @@ void show_panel() {
     g_ui.settings_anim = 0;
     g_ui.confirm_open = false;
     g_ui.confirm_index = -1;
+    g_ui.update_dialog_open = false;
+    g_ui.update_ignore_checked = false;
     g_ui.callout_open = false;
     g_ui.dock_ox = 0;
     g_ui.dock_oy = 0;
@@ -1000,6 +1069,7 @@ void show_panel() {
     for (int i = 0; i < kProviderCount; ++i) {
         if (g_ui.model_pinned[i]) {
             g_ui.model_open[i] = true;
+            g_ui.card_raise_pending[i] = true;
             g_ui.callout_open = true;
         } else {
             g_ui.model_open[i] = false;
@@ -1028,6 +1098,9 @@ void show_panel() {
 
 void hide_panel() {
     if (g_ui.api_key_mode || g_ui.oauth_code_mode) return;
+    if (g_ui.update_installing) return;
+    g_ui.update_dialog_open = false;
+    g_ui.update_ignore_checked = false;
     if (g_ui.pinned) {
         request_settings(false);
         for (int i = 0; i < kProviderCount; ++i) {
@@ -1120,7 +1193,7 @@ void tick_ui(float dt) {
     bool left = left_sheet_open();
     for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_anim[i] > 0.02f) left = true;
     g_ui.left_anim = approach(g_ui.left_anim, left ? 1.0f : 0.0f, dt, 13.0f);
-    bool sheet_target = g_ui.settings_target || g_ui.api_key_mode || g_ui.oauth_code_mode || g_ui.confirm_open;
+    bool sheet_target = g_ui.settings_target || g_ui.api_key_mode || g_ui.oauth_code_mode || g_ui.confirm_open || g_ui.update_dialog_open;
     g_ui.settings_anim = approach(g_ui.settings_anim, sheet_target ? 1.0f : 0.0f, dt, 13.0f);
     if (!sheet_target && g_ui.settings_open && g_ui.settings_anim < 0.02f) g_ui.settings_open = false;
     float target_y = 0, target_h = 0;
@@ -1640,6 +1713,14 @@ void button(Rect r, const std::string& label, bool enabled = true) {
     button_styled(r, label, enabled, color(245, 245, 247));
 }
 
+void cycle_button(Rect r, const std::string& label, Rect* previous, Rect* next) {
+    button(r, label, true);
+    *previous = {r.x, r.y, 24, r.h};
+    *next = {r.x + r.w - 24, r.y, 24, r.h};
+    text(previous->x + 8, r.y + 5, "<", 174, 174, 178, true, true);
+    text(next->x + 8, r.y + 5, ">", 174, 174, 178, true, true);
+}
+
 void usage_track(float x, float y, float width, double used, bool weekly) {
     fill_round({x, y, width, 6}, 3, 44, 44, 48);
     float fw = static_cast<float>(display_percent(used) / 100.0 * width);
@@ -1877,6 +1958,20 @@ void draw_panel() {
     g_ui.settings_refresh_interval = {};
     g_ui.settings_scale = {};
     g_ui.settings_time_format = {};
+    g_ui.settings_window_mode = {};
+    g_ui.settings_refresh_prev = {};
+    g_ui.settings_refresh_next = {};
+    g_ui.settings_scale_prev = {};
+    g_ui.settings_scale_next = {};
+    g_ui.settings_time_prev = {};
+    g_ui.settings_time_next = {};
+    g_ui.settings_window_prev = {};
+    g_ui.settings_window_next = {};
+    g_ui.settings_update_toggle = {};
+    g_ui.settings_check_updates = {};
+    g_ui.update_yes = {};
+    g_ui.update_later = {};
+    g_ui.update_ignore = {};
     for (int i = 0; i < kProviderCount; ++i) {
         g_ui.model_callout_rect[i] = {};
         g_ui.model_pin_button[i] = {};
@@ -1919,7 +2014,37 @@ void draw_panel() {
             float card_y = 0, card_h = 0;
             left_card_geom(&card_y, &card_h);
             draw_left_card_chrome(card_x, card_y, card_h, 255);
-            if (g_ui.api_key_mode) {
+            if (g_ui.update_dialog_open) {
+                if (g_ui.update_installing) {
+                    text(card_x + 18, card_y + 16, "Updating", 245, 245, 247, true);
+                    text(card_x + 18, card_y + 48, "Downloading version " + g_ui.update_version + "...", 245, 245, 247, false, true);
+                    text(card_x + 18, card_y + 72, "The app will restart automatically.", 142, 142, 147, false, true);
+                    g_ui.update_yes = {};
+                    g_ui.update_later = {};
+                    g_ui.update_ignore = {};
+                } else if (!g_ui.update_error.empty()) {
+                    text(card_x + 18, card_y + 16, "Update failed", 245, 245, 247, true);
+                    text(card_x + 18, card_y + 48, clip_text(g_ui.update_error, 300, false, true), 240, 120, 120, false, true);
+                    text(card_x + 18, card_y + 76, "Try again or choose Later.", 142, 142, 147, false, true);
+                    g_ui.update_ignore = {};
+                    g_ui.update_yes = {card_x + 18, card_y + 150, 144, 30};
+                    g_ui.update_later = {card_x + 174, card_y + 150, 144, 30};
+                    button_styled(g_ui.update_yes, "Retry", true, color(245, 245, 247), true);
+                    button(g_ui.update_later, "Later", true);
+                } else {
+                    text(card_x + 18, card_y + 16, "Update available", 245, 245, 247, true);
+                    text(card_x + 18, card_y + 46, "Version " + g_ui.update_version + " is ready.", 245, 245, 247, false, true);
+                    text(card_x + 18, card_y + 68, "Download and restart automatically?", 142, 142, 147, false, true);
+                    g_ui.update_ignore = {card_x + 18, card_y + 100, 18, 18};
+                    aa_round_rect(g_ui.update_ignore, 4, color(36, 36, 38), color(72, 72, 78));
+                    if (g_ui.update_ignore_checked) fill_round({g_ui.update_ignore.x + 4, g_ui.update_ignore.y + 4, 10, 10}, 5, 48, 209, 88);
+                    text(card_x + 46, card_y + 99, "Ignore this update", 174, 174, 178, false, true);
+                    g_ui.update_yes = {card_x + 18, card_y + 150, 144, 30};
+                    g_ui.update_later = {card_x + 174, card_y + 150, 144, 30};
+                    button_styled(g_ui.update_yes, "Yes", true, color(245, 245, 247), true);
+                    button(g_ui.update_later, "Later", true);
+                }
+            } else if (g_ui.api_key_mode) {
                 text(card_x + 18, card_y + 16, "GLM API key", 245, 245, 247, true);
                 text(card_x + 18, card_y + 40, "Paste key. Saved in the platform secret store.", 142, 142, 147, false, true);
                 g_ui.api_input = {card_x + 18, card_y + 68, 300, 32};
@@ -1974,16 +2099,27 @@ void draw_panel() {
                 float interval_y = fill_y + 40;
                 text(card_x + 18, interval_y + 8, "Refresh interval", 245, 245, 247, true, true);
                 g_ui.settings_refresh_interval = {card_x + 210, interval_y + 4, 100, 30};
-                button(g_ui.settings_refresh_interval, refresh_interval_label(g_ui.refresh_interval_seconds), true);
+                cycle_button(g_ui.settings_refresh_interval, refresh_interval_label(g_ui.refresh_interval_seconds), &g_ui.settings_refresh_prev, &g_ui.settings_refresh_next);
                 float scale_y = fill_y + 84;
                 text(card_x + 18, scale_y + 8, "UI scale", 245, 245, 247, true, true);
                 g_ui.settings_scale = {card_x + 210, scale_y + 4, 100, 30};
-                button(g_ui.settings_scale, ui_scale_label(g_ui.ui_scale), true);
+                cycle_button(g_ui.settings_scale, ui_scale_label(g_ui.ui_scale), &g_ui.settings_scale_prev, &g_ui.settings_scale_next);
                 float time_y = fill_y + 128;
                 text(card_x + 18, time_y + 8, "Time format", 245, 245, 247, true, true);
                 g_ui.settings_time_format = {card_x + 210, time_y + 4, 100, 30};
-                button(g_ui.settings_time_format, g_ui.use_24_hour ? "24-hour" : "12-hour", true);
-                float add_y = fill_y + 172;
+                cycle_button(g_ui.settings_time_format, g_ui.use_24_hour ? "24-hour" : "12-hour", &g_ui.settings_time_prev, &g_ui.settings_time_next);
+                float mode_y = fill_y + 172;
+                text(card_x + 18, mode_y + 8, "Window mode", 245, 245, 247, true, true);
+                g_ui.settings_window_mode = {card_x + 184, mode_y + 4, 124, 30};
+                cycle_button(g_ui.settings_window_mode, g_ui.always_on_top ? "Always on top" : "Desktop widget", &g_ui.settings_window_prev, &g_ui.settings_window_next);
+                float update_y = fill_y + 216;
+                text(card_x + 18, update_y + 8, "Update checking", 245, 245, 247, true, true);
+                g_ui.settings_update_toggle = {card_x + 156, update_y + 12, 36, 22};
+                aa_round_rect(g_ui.settings_update_toggle, 11, g_ui.update_check_enabled ? color(48, 209, 88) : color(58, 58, 62), g_ui.update_check_enabled ? color(48, 209, 88) : color(58, 58, 62));
+                fill_round({g_ui.settings_update_toggle.x + (g_ui.update_check_enabled ? 18.0f : 4.0f), update_y + 15, 16, 16}, 8, 245, 245, 247);
+                g_ui.settings_check_updates = {card_x + 210, update_y + 4, 100, 30};
+                button(g_ui.settings_check_updates, "Check now", true);
+                float add_y = fill_y + 260;
                 int hidden_n = 0;
                 for (int k = 0; k < kKindCount; ++k) {
                     if (g_app.listed[k]) continue;
@@ -2067,7 +2203,8 @@ bool create_card_window(int index) {
     g_ui.card_window_id[index] = SDL_GetWindowID(window);
     g_ui.card_window_width[index] = width;
     g_ui.card_window_height[index] = height;
-    SDL_SetWindowFocusable(window, false);
+    SDL_SetWindowFocusable(window, !g_ui.always_on_top);
+    SDL_SetWindowAlwaysOnTop(window, g_ui.always_on_top);
     SDL_SetWindowSize(window, width, height);
     SDL_SyncWindow(window);
     SDL_SetRenderLogicalPresentation(renderer, logical_width, logical_height, SDL_LOGICAL_PRESENTATION_STRETCH);
@@ -2138,6 +2275,11 @@ void sync_card_windows() {
         if (!g_ui.card_window_visible[i]) {
             SDL_ShowWindow(g_ui.card_window[i]);
             g_ui.card_window_visible[i] = true;
+            SDL_RaiseWindow(g_ui.card_window[i]);
+        }
+        if (g_ui.card_raise_pending[i]) {
+            SDL_RaiseWindow(g_ui.card_window[i]);
+            g_ui.card_raise_pending[i] = false;
         }
     }
 }
@@ -2309,8 +2451,140 @@ void save_layout() {
     json += ",\"refresh_seconds\":" + std::to_string(g_ui.refresh_interval_seconds);
     json += ",\"ui_scale\":" + std::to_string(g_ui.ui_scale);
     json += ",\"time_24h\":" + std::string(g_ui.use_24_hour ? "1" : "0");
+    json += ",\"always_on_top\":" + std::string(g_ui.always_on_top ? "1" : "0");
+    json += ",\"update_check\":" + std::string(g_ui.update_check_enabled ? "1" : "0");
+    json += ",\"update_ignored\":\"" + json_escape(g_ui.update_ignored_version) + "\"";
     json += "}";
     try { credential_save_named("layout", json); } catch (const std::exception&) { }
+}
+
+void start_update_check(bool manual) {
+    if (!manual && !g_ui.update_check_enabled) return;
+    {
+        std::lock_guard<std::mutex> lock(g_update_check.mutex);
+        if (g_update_check.in_flight) return;
+        g_update_check.in_flight = true;
+        g_update_check.complete = false;
+        g_update_check.manual = manual;
+        g_update_check.info.reset();
+    }
+    std::thread([] {
+        try {
+            std::optional<UpdateInfo> info = check_for_update();
+            std::lock_guard<std::mutex> lock(g_update_check.mutex);
+            g_update_check.info = std::move(info);
+            g_update_check.complete = true;
+            g_update_check.in_flight = false;
+        } catch (const std::exception& error) {
+            diagnostics_log("update check error=" + std::string(error.what()));
+            std::lock_guard<std::mutex> lock(g_update_check.mutex);
+            g_update_check.info.reset();
+            g_update_check.complete = true;
+            g_update_check.in_flight = false;
+        }
+    }).detach();
+}
+
+void poll_update_check_result() {
+    std::optional<UpdateInfo> info;
+    bool manual = false;
+    {
+        std::lock_guard<std::mutex> lock(g_update_check.mutex);
+        if (!g_update_check.complete) return;
+        info = std::move(g_update_check.info);
+        manual = g_update_check.manual;
+        g_update_check.complete = false;
+    }
+    if (!info || (!manual && !g_ui.update_check_enabled) || info->version == g_ui.update_ignored_version) return;
+    g_ui.update_version = info->version;
+    g_ui.update_sha256 = info->sha256;
+    g_ui.update_release_url = info->release_url;
+    g_ui.update_asset_url = info->asset_url;
+    g_ui.update_ignore_checked = false;
+    g_ui.settings_open = false;
+    g_ui.settings_target = false;
+    g_ui.confirm_open = false;
+    g_ui.confirm_index = -1;
+    if (!g_ui.visible) show_panel();
+    g_ui.update_dialog_open = true;
+    set_target_height(wanted_panel_height());
+    apply_layout();
+}
+
+void start_update_install() {
+    if (g_ui.update_installing) return;
+    UpdateInfo info;
+    info.version = g_ui.update_version;
+    info.sha256 = g_ui.update_sha256;
+    info.release_url = g_ui.update_release_url;
+    info.asset_url = g_ui.update_asset_url;
+    {
+        std::lock_guard<std::mutex> lock(g_update_install.mutex);
+        if (g_update_install.in_flight) return;
+        g_update_install.in_flight = true;
+        g_update_install.complete = false;
+        g_update_install.staged.clear();
+        g_update_install.error.clear();
+    }
+    g_ui.update_installing = true;
+    g_ui.update_error.clear();
+    std::thread([info] {
+        try {
+            std::filesystem::path staged = download_update(info);
+            std::lock_guard<std::mutex> lock(g_update_install.mutex);
+            g_update_install.staged = std::move(staged);
+            g_update_install.complete = true;
+            g_update_install.in_flight = false;
+        } catch (const std::exception& error) {
+            diagnostics_log("update install error=" + std::string(error.what()));
+            std::lock_guard<std::mutex> lock(g_update_install.mutex);
+            g_update_install.error = error.what();
+            g_update_install.complete = true;
+            g_update_install.in_flight = false;
+        }
+    }).detach();
+}
+
+void poll_update_install_result() {
+    std::filesystem::path staged;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lock(g_update_install.mutex);
+        if (!g_update_install.complete) return;
+        staged = std::move(g_update_install.staged);
+        error = std::move(g_update_install.error);
+        g_update_install.complete = false;
+    }
+    if (!error.empty()) {
+        g_ui.update_installing = false;
+        g_ui.update_error = error;
+        return;
+    }
+    if (staged.empty() || !launch_update_helper(staged, current_executable_path(), g_ui.update_sha256)) {
+        g_ui.update_installing = false;
+        g_ui.update_error = "Unable to start update helper";
+        std::error_code cleanup_error;
+        std::filesystem::remove(staged, cleanup_error);
+        return;
+    }
+    g_ui.update_dialog_open = false;
+    g_ui.update_installing = false;
+    g_ui.visible = false;
+    SDL_HideWindow(g_ui.window);
+    g_quit = true;
+}
+
+void finish_update_dialog(bool install) {
+    if (g_ui.update_ignore_checked) g_ui.update_ignored_version = g_ui.update_version;
+    if (!g_ui.update_ignored_version.empty()) save_layout();
+    if (install) {
+        start_update_install();
+        return;
+    }
+    g_ui.update_dialog_open = false;
+    g_ui.update_ignore_checked = false;
+    set_target_height(wanted_panel_height());
+    apply_layout();
 }
 
 void logout_provider(int index) {
@@ -2377,6 +2651,7 @@ int alloc_slot(int kind, int acct = -1) {
 
 void toggle_model_pin(int index) {
     g_ui.model_open[index] = true;
+    g_ui.card_raise_pending[index] = true;
     g_ui.model_pinned[index] = !g_ui.model_pinned[index];
     if (g_ui.model_pinned[index]) {
         g_ui.model_detached[index] = true;
@@ -2412,6 +2687,7 @@ void toggle_model_callout(int index) {
         if (j != index && model_is_snapped(j)) g_ui.model_open[j] = false;
     }
     g_ui.model_open[index] = true;
+    g_ui.card_raise_pending[index] = true;
     g_ui.model_detached[index] = false;
     g_ui.model_off_x[index] = snap_off_x();
     g_ui.model_off_y[index] = snap_off_y(index);
@@ -2425,6 +2701,12 @@ void handle_right_click(float, float) {
 }
 
 void handle_click(float x, float y) {
+    if (g_ui.update_dialog_open) {
+        if (contains(g_ui.update_ignore, x, y)) g_ui.update_ignore_checked = !g_ui.update_ignore_checked;
+        else if (contains(g_ui.update_yes, x, y)) finish_update_dialog(true);
+        else if (contains(g_ui.update_later, x, y)) finish_update_dialog(false);
+        return;
+    }
     if (g_ui.confirm_open) {
         if (contains(g_ui.confirm_delete, x, y)) remove_provider_slot(g_ui.confirm_index);
         else if (contains(g_ui.confirm_cancel, x, y)) { g_ui.confirm_open = false; g_ui.confirm_index = -1; }
@@ -2491,9 +2773,31 @@ void handle_click(float x, float y) {
             save_layout();
             return;
         }
+        if (contains(g_ui.settings_refresh_prev, x, y)) {
+            g_ui.refresh_interval_seconds = previous_refresh_interval(g_ui.refresh_interval_seconds);
+            save_layout();
+            return;
+        }
+        if (contains(g_ui.settings_refresh_next, x, y)) {
+            g_ui.refresh_interval_seconds = next_refresh_interval(g_ui.refresh_interval_seconds);
+            save_layout();
+            return;
+        }
         if (contains(g_ui.settings_refresh_interval, x, y)) {
             g_ui.refresh_interval_seconds = next_refresh_interval(g_ui.refresh_interval_seconds);
             save_layout();
+            return;
+        }
+        if (contains(g_ui.settings_scale_prev, x, y)) {
+            g_ui.ui_scale = previous_ui_scale(g_ui.ui_scale);
+            save_layout();
+            apply_ui_scale();
+            return;
+        }
+        if (contains(g_ui.settings_scale_next, x, y)) {
+            g_ui.ui_scale = next_ui_scale(g_ui.ui_scale);
+            save_layout();
+            apply_ui_scale();
             return;
         }
         if (contains(g_ui.settings_scale, x, y)) {
@@ -2502,9 +2806,35 @@ void handle_click(float x, float y) {
             apply_ui_scale();
             return;
         }
+        if (contains(g_ui.settings_time_prev, x, y) || contains(g_ui.settings_time_next, x, y)) {
+            g_ui.use_24_hour = !g_ui.use_24_hour;
+            save_layout();
+            return;
+        }
         if (contains(g_ui.settings_time_format, x, y)) {
             g_ui.use_24_hour = !g_ui.use_24_hour;
             save_layout();
+            return;
+        }
+        if (contains(g_ui.settings_window_prev, x, y) || contains(g_ui.settings_window_next, x, y)) {
+            g_ui.always_on_top = !g_ui.always_on_top;
+            apply_window_mode();
+            save_layout();
+            return;
+        }
+        if (contains(g_ui.settings_window_mode, x, y)) {
+            g_ui.always_on_top = !g_ui.always_on_top;
+            apply_window_mode();
+            save_layout();
+            return;
+        }
+        if (contains(g_ui.settings_update_toggle, x, y)) {
+            g_ui.update_check_enabled = !g_ui.update_check_enabled;
+            save_layout();
+            return;
+        }
+        if (contains(g_ui.settings_check_updates, x, y)) {
+            start_update_check(true);
             return;
         }
         for (int k = 0; k < kKindCount; ++k) {
@@ -2584,6 +2914,11 @@ void handle_mouse_down(float x, float y) {
     g_ui.reorder_slot = -1;
     g_ui.pending_ring = -1;
     if (g_ui.confirm_open) {
+        if (over_click_target(x, y)) handle_click(x, y);
+        g_ui.click_armed = true;
+        return;
+    }
+    if (g_ui.update_dialog_open) {
         if (over_click_target(x, y)) handle_click(x, y);
         g_ui.click_armed = true;
         return;
@@ -2754,6 +3089,9 @@ void load_layout() {
         if (valid_ui_scale(value)) g_ui.ui_scale = value;
     }
     if (auto time = json_number(*raw, "time_24h")) g_ui.use_24_hour = *time != 0;
+    if (auto top = json_number(*raw, "always_on_top")) g_ui.always_on_top = *top != 0;
+    if (auto updates = json_number(*raw, "update_check")) g_ui.update_check_enabled = *updates != 0;
+    g_ui.update_ignored_version = json_string(*raw, "update_ignored").value_or("");
     std::lock_guard<std::mutex> lock(g_app.mutex);
     for (int i = 0; i < kKindCount; ++i) {
         if (auto flag = json_number(*raw, "l" + std::to_string(i))) g_app.listed[i] = *flag != 0;
@@ -2852,6 +3190,7 @@ bool init_fonts() {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--apply-update") return apply_update_helper(argc, argv);
     bool debug = false;
     for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--debug") debug = true;
     diagnostics_init(debug);
@@ -2879,6 +3218,7 @@ int main(int argc, char** argv) {
     g_ui.renderer = SDL_CreateRenderer(g_ui.window, nullptr);
     if (!g_ui.renderer) return 1;
     init_state();
+    apply_window_mode();
     g_ui.premul = SDL_ComposeCustomBlendMode(
         SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD,
         SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD);
@@ -2893,6 +3233,7 @@ int main(int argc, char** argv) {
     icons_load(g_ui.renderer);
 
     create_tray();
+    if (g_ui.update_check_enabled) start_update_check(false);
     for (int i = 0; i < kProviderCount; ++i) {
         if (provider_has_auth(i)) refresh_usage_async_for(i, true);
     }
@@ -2985,6 +3326,8 @@ int main(int argc, char** argv) {
         }
 
         if (g_show_requested) show_panel();
+        poll_update_check_result();
+        poll_update_install_result();
         if (g_refresh_requested.exchange(false)) refresh_usage_async_for(selected_provider(), true);
         if (g_warm_requested.exchange(false)) warm_async_for(selected_provider());
         if (g_ui.dragging_model >= 0 && !(SDL_GetGlobalMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK)) end_card_drag(g_ui.dragging_model);

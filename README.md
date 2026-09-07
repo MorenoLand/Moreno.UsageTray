@@ -77,6 +77,8 @@ The popup is a compact ring dock plus a detail card:
 - click a ring for the callout (session/CLI and weekly/Bot bars, reset times)
 - gear opens Settings to enable providers, sign in or out, and refresh
 - pin keeps the popup open; drag the cards to reposition
+- Window mode can keep the dock above other windows or leave it as a desktop widget
+- Settings can check for releases and install the matching platform update
 - right-click the dock to toggle Settings
 
 GLM uses:
@@ -129,6 +131,10 @@ Grok uses the public Grok CLI OAuth client against `auth.x.ai`:
 Run `LLMUsageTray.exe --debug` from a terminal. Redacted diagnostics are mirrored to
 the terminal and written to `app.log` beside the executable. Normal launches do not
 emit diagnostics.
+
+## Updates
+
+The release workflow publishes `latest.json` with the current version, platform binary URLs, and executable SHA-256 values. The Settings update controls download, verify, and install that binary through a helper restart.
 
 ## License
 

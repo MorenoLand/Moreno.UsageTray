@@ -52,6 +52,7 @@ set(LLM_USAGE_TRAY_SOURCES
     src/diagnostics.cpp
     src/json_util.cpp
     src/oauth.cpp
+    src/update.cpp
     src/usage.cpp
     src/svg_icons.cpp
 )

@@ -63,13 +63,16 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item build/Release/LLMUsageTray.exe dist/LLMUsageTray.exe
+          Copy-Item build/Release/LLMUsageTray.exe "dist/LLMUsageTray-${{ needs.version.outputs.version }}-windows-x64.exe"
           Compress-Archive -Path dist/LLMUsageTray.exe -DestinationPath "dist/LLMUsageTray-${{ needs.version.outputs.version }}-windows-x64.zip" -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: LLMUsageTray-${{ needs.version.outputs.version }}-windows-x64
-          path: dist/LLMUsageTray-${{ needs.version.outputs.version }}-windows-x64.zip
+          path: |
+            dist/LLMUsageTray-${{ needs.version.outputs.version }}-windows-x64.exe
+            dist/LLMUsageTray-${{ needs.version.outputs.version }}-windows-x64.zip
           if-no-files-found: error
 
   macos:
@@ -93,6 +96,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
+          cp build/LLMUsageTray.app/Contents/MacOS/LLMUsageTray "dist/LLMUsageTray-${{ needs.version.outputs.version }}-macos"
           cp -R build/LLMUsageTray.app dist/LLMUsageTray.app
           tar -czf "dist/LLMUsageTray-${{ needs.version.outputs.version }}-macos.tar.gz" -C dist LLMUsageTray.app
 
@@ -100,7 +104,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: LLMUsageTray-${{ needs.version.outputs.version }}-macos
-          path: dist/LLMUsageTray-${{ needs.version.outputs.version }}-macos.tar.gz
+          path: |
+            dist/LLMUsageTray-${{ needs.version.outputs.version }}-macos
+            dist/LLMUsageTray-${{ needs.version.outputs.version }}-macos.tar.gz
           if-no-files-found: error
 
   linux:
@@ -144,6 +150,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
+          cp build/LLMUsageTray "dist/LLMUsageTray-${{ needs.version.outputs.version }}-linux-x64"
           cp build/LLMUsageTray dist/LLMUsageTray
           tar -czf "dist/LLMUsageTray-${{ needs.version.outputs.version }}-linux-x64.tar.gz" -C dist LLMUsageTray
 
@@ -151,7 +158,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: LLMUsageTray-${{ needs.version.outputs.version }}-linux-x64
-          path: dist/LLMUsageTray-${{ needs.version.outputs.version }}-linux-x64.tar.gz
+          path: |
+            dist/LLMUsageTray-${{ needs.version.outputs.version }}-linux-x64
+            dist/LLMUsageTray-${{ needs.version.outputs.version }}-linux-x64.tar.gz
           if-no-files-found: error
 
   release:
@@ -171,12 +180,44 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Generate update metadata
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p release-metadata
+          windows_sha=$(sha256sum "dist/LLMUsageTray-${VERSION}-windows-x64.exe" | awk '{print $1}')
+          macos_sha=$(sha256sum "dist/LLMUsageTray-${VERSION}-macos" | awk '{print $1}')
+          linux_sha=$(sha256sum "dist/LLMUsageTray-${VERSION}-linux-x64" | awk '{print $1}')
+          cat > release-metadata/latest.json <<EOF
+          {
+            "schema": 1,
+            "version": "${VERSION}",
+            "release_url": "https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}",
+            "windows_x64_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/LLMUsageTray-${VERSION}-windows-x64.exe",
+            "windows_x64_sha256": "${windows_sha}",
+            "windows_x64_archive_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/LLMUsageTray-${VERSION}-windows-x64.zip",
+            "macos_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/LLMUsageTray-${VERSION}-macos",
+            "macos_sha256": "${macos_sha}",
+            "macos_archive_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/LLMUsageTray-${VERSION}-macos.tar.gz",
+            "linux_x64_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/LLMUsageTray-${VERSION}-linux-x64",
+            "linux_x64_sha256": "${linux_sha}",
+            "linux_x64_archive_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/LLMUsageTray-${VERSION}-linux-x64.tar.gz"
+          }
+          EOF
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          gh release create "v${VERSION}" dist/* \
+          gh release create "v${VERSION}" \
+            "dist/LLMUsageTray-${VERSION}-windows-x64.exe" \
+            "dist/LLMUsageTray-${VERSION}-windows-x64.zip" \
+            "dist/LLMUsageTray-${VERSION}-macos" \
+            "dist/LLMUsageTray-${VERSION}-macos.tar.gz" \
+            "dist/LLMUsageTray-${VERSION}-linux-x64" \
+            "dist/LLMUsageTray-${VERSION}-linux-x64.tar.gz" \
+            release-metadata/latest.json \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --title "LLM Usage Tray v${VERSION}" \
