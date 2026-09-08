@@ -278,6 +278,7 @@ AppState g_app;
 UiState g_ui;
 std::atomic_bool g_quit{false};
 std::atomic_bool g_show_requested{false};
+std::atomic_bool g_tray_toggle_requested{false};
 std::atomic_bool g_refresh_requested{false};
 std::atomic_bool g_warm_requested{false};
 
@@ -1189,6 +1190,17 @@ void hide_panel() {
     }
     SDL_HideWindow(g_ui.window);
     sync_card_windows();
+}
+
+void toggle_panel_from_tray() {
+    if (!g_ui.visible) {
+        show_panel();
+        return;
+    }
+    bool pinned = g_ui.pinned;
+    g_ui.pinned = false;
+    hide_panel();
+    g_ui.pinned = pinned;
 }
 
 void polish_native_window() {
@@ -2802,7 +2814,7 @@ void on_tray_recall(void*, SDL_TrayEntry*) { recall_meters(); }
 void on_tray_quit(void*, SDL_TrayEntry*) { g_quit = true; }
 
 bool on_tray_left_click(void*, SDL_Tray*) {
-    g_show_requested = true;
+    g_tray_toggle_requested = true;
     return false;
 }
 
@@ -3814,7 +3826,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (g_show_requested) show_panel();
+        if (g_tray_toggle_requested.exchange(false)) toggle_panel_from_tray();
+        else if (g_show_requested) show_panel();
         poll_update_check_result();
         poll_update_install_result();
         if (g_refresh_requested.exchange(false)) refresh_usage_async_for(selected_provider(), true);
