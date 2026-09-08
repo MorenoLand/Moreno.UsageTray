@@ -63,7 +63,7 @@ constexpr int kPanelWidth = kCalloutWidth + kCardGap + kTailWidth + kDockWidth;
 constexpr int kDockPad = 14;
 constexpr int kRingSize = 52;
 constexpr int kRingSlot = 78;
-constexpr int kDockFooter = 44;
+constexpr int kDockFooter = 50;
 constexpr int kCalloutHeight = 168;
 constexpr int kCalloutSingleRowHeight = 112;
 constexpr int kSettingsRowHeight = 52;
@@ -73,6 +73,8 @@ constexpr int kSettingsFooter = 56;
 constexpr int kFormSheetHeight = 168;
 constexpr int kUpdateDialogHeight = 206;
 constexpr int kUpdateInstallingHeight = 154;
+constexpr int kMeterWindowWidth = 84;
+constexpr int kMeterWindowHeight = 76;
 constexpr int kDefaultRefreshIntervalSeconds = 300;
 constexpr float kDefaultUiScale = 1.0f;
 constexpr int kKindCount = 5;
@@ -134,6 +136,14 @@ struct UiState {
     int card_window_y[kProviderCount]{};
     int card_window_width[kProviderCount]{};
     int card_window_height[kProviderCount]{};
+    SDL_Window* meter_card_window[kProviderCount]{};
+    SDL_Renderer* meter_card_renderer[kProviderCount]{};
+    SDL_WindowID meter_card_window_id[kProviderCount]{};
+    bool meter_card_window_visible[kProviderCount]{};
+    int meter_card_window_x[kProviderCount]{};
+    int meter_card_window_y[kProviderCount]{};
+    int meter_card_window_width[kProviderCount]{};
+    int meter_card_window_height[kProviderCount]{};
     Rect card_pin_button[kProviderCount];
     SDL_Tray* tray = nullptr;
     SDL_Surface* icon = nullptr;
@@ -173,6 +183,17 @@ struct UiState {
     Rect model_pin_button[kProviderCount];
     bool model_open[kProviderCount]{};
     bool model_pinned[kProviderCount]{};
+    bool meter_pinned[kProviderCount]{};
+    bool meter_returning[kProviderCount]{};
+    bool meter_card_open[kProviderCount]{};
+    float meter_anim[kProviderCount]{};
+    int meter_screen_x[kProviderCount]{};
+    int meter_screen_y[kProviderCount]{};
+    int meter_card_screen_x[kProviderCount]{};
+    int meter_card_screen_y[kProviderCount]{};
+    float meter_press_x = 0;
+    float meter_press_y = 0;
+    bool dragging_meter_card = false;
     bool card_raise_pending[kProviderCount]{};
     bool model_detached[kProviderCount]{};
     float model_off_x[kProviderCount]{};
@@ -401,6 +422,7 @@ int collect_visible(int* out) {
         bool fading = g_ui.slot_anim[i] > 0.02f;
         if ((!enabled[i] && !fading) || kind < 0) continue;
         if (!fading && i < kKindCount && !listed[kind]) continue;
+        if (g_ui.meter_pinned[i] && !g_ui.meter_returning[i] && !fading) continue;
         if (out) out[n] = i;
         ++n;
     }
@@ -579,7 +601,7 @@ bool any_model_pinned_open() {
 }
 
 bool model_is_snapped(int index) {
-    return g_ui.model_open[index] && !g_ui.model_pinned[index] && !g_ui.model_detached[index];
+    return g_ui.model_open[index] && !g_ui.model_pinned[index] && !g_ui.model_detached[index] && !g_ui.meter_pinned[index];
 }
 
 double display_percent(double used) {
@@ -645,9 +667,14 @@ int enabled_count() {
     return collect_visible(nullptr);
 }
 
+bool any_meter_pinned() {
+    for (int i = 0; i < kProviderCount; ++i) if (g_ui.meter_pinned[i]) return true;
+    return false;
+}
+
 int dock_height() {
     int n = enabled_count();
-    if (n < 1) n = 1;
+    if (n < 1 && !any_meter_pinned()) n = 1;
     return kDockPad + n * kRingSlot + kDockFooter;
 }
 
@@ -873,6 +900,31 @@ int wanted_panel_height() {
     return dock;
 }
 
+bool usable_bounds_for_point(int x, int y, SDL_Rect* usable) {
+#if defined(_WIN32)
+    POINT win_point{x, y};
+    HMONITOR monitor = MonitorFromPoint(win_point, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{sizeof(info)};
+    if (monitor && GetMonitorInfoW(monitor, &info)) {
+        usable->x = info.rcWork.left;
+        usable->y = info.rcWork.top;
+        usable->w = info.rcWork.right - info.rcWork.left;
+        usable->h = info.rcWork.bottom - info.rcWork.top;
+        if (usable->w > 0 && usable->h > 0) return true;
+    }
+#endif
+    SDL_Point point{x, y};
+    SDL_DisplayID display = SDL_GetDisplayForPoint(&point);
+    return display && SDL_GetDisplayUsableBounds(display, usable);
+}
+
+void clamp_window_to_usable(const SDL_Rect& usable, int width, int height, int* x, int* y) {
+    if (width <= usable.w) *x = std::clamp(*x, usable.x, usable.x + usable.w - width);
+    else *x = usable.x;
+    if (height <= usable.h) *y = std::clamp(*y, usable.y, usable.y + usable.h - height);
+    else *y = usable.y;
+}
+
 void anchor_current_bottom() {
     int wx = 0;
     int wy = 0;
@@ -917,6 +969,10 @@ void apply_window_mode() {
         SDL_SetWindowAlwaysOnTop(g_ui.card_window[i], g_ui.always_on_top);
         SDL_SetWindowFocusable(g_ui.card_window[i], !g_ui.always_on_top);
     }
+    for (int i = 0; i < kProviderCount; ++i) if (g_ui.meter_card_window[i]) {
+        SDL_SetWindowAlwaysOnTop(g_ui.meter_card_window[i], g_ui.always_on_top);
+        SDL_SetWindowFocusable(g_ui.meter_card_window[i], !g_ui.always_on_top);
+    }
 }
 
 void capture_dock_anchor() {
@@ -955,7 +1011,7 @@ void end_card_drag(int index);
 void handle_card_mouse_down(int index, float x, float y);
 void handle_card_mouse_up(int index);
 int card_index_for_window(SDL_WindowID window_id);
-void card_event_logical(int index, SDL_Event event, float* x, float* y);
+void card_event_logical(int index, SDL_Event event, float* x, float* y, SDL_Renderer* renderer = nullptr);
 void toggle_model_pin(int index);
 
 void apply_layout() {
@@ -965,9 +1021,8 @@ void apply_layout() {
     int dw = std::max(1, static_cast<int>(std::lround(static_cast<float>(kDockWidth) * scale)));
     int dh = std::max(1, static_cast<int>(std::lround(static_cast<float>(dock_height()) * scale)));
     int left = dsx, top = dsy, right = dsx + dw, bottom = dsy + dh;
-    SDL_DisplayID display = SDL_GetDisplayForWindow(g_ui.window);
     SDL_Rect usable{};
-    bool has_usable = display && SDL_GetDisplayUsableBounds(display, &usable);
+    bool has_usable = usable_bounds_for_point(dsx, dsy, &usable);
     int sheet_y = dsy;
     auto include = [&](int x, int y, int w, int h) {
         left = std::min(left, x);
@@ -1042,6 +1097,7 @@ void close_menus() {
     g_ui.update_dialog_open = false;
     g_ui.update_ignore_checked = false;
     for (int i = 0; i < kProviderCount; ++i) {
+        if (g_ui.meter_card_open[i] && !g_ui.model_pinned[i]) g_ui.meter_card_open[i] = false;
         if (g_ui.model_open[i] && !g_ui.model_pinned[i]) {
             g_ui.model_open[i] = false;
             g_ui.model_detached[i] = false;
@@ -1088,7 +1144,13 @@ void show_panel() {
     float mx = 0, my = 0;
     SDL_GetGlobalMouseState(&mx, &my);
     g_ui.anchor_bottom = static_cast<int>(my) - static_cast<int>(std::round(12 * g_ui.panel_scale));
-    SDL_SetWindowPosition(g_ui.window, static_cast<int>(mx) - panel_width_px() + static_cast<int>(std::round(20 * g_ui.panel_scale)), g_ui.anchor_bottom - panel_height_px());
+    int window_x = static_cast<int>(mx) - panel_width_px() + static_cast<int>(std::round(20 * g_ui.panel_scale));
+    int window_y = g_ui.anchor_bottom - panel_height_px();
+    if (!g_ui.always_on_top) {
+        SDL_Rect usable{};
+        if (usable_bounds_for_point(static_cast<int>(std::round(mx)), static_cast<int>(std::round(my)), &usable)) clamp_window_to_usable(usable, panel_width_px(), panel_height_px(), &window_x, &window_y);
+    }
+    SDL_SetWindowPosition(g_ui.window, window_x, window_y);
     capture_dock_anchor();
     preserve_pinned_card_positions();
     g_ui.preserving_pinned_cards = false;
@@ -1107,6 +1169,7 @@ void hide_panel() {
     if (g_ui.pinned) {
         request_settings(false);
         for (int i = 0; i < kProviderCount; ++i) {
+            if (g_ui.meter_card_open[i] && !g_ui.model_pinned[i]) g_ui.meter_card_open[i] = false;
             if (g_ui.model_open[i] && !g_ui.model_pinned[i]) {
                 g_ui.model_open[i] = false;
                 g_ui.model_detached[i] = false;
@@ -1120,6 +1183,7 @@ void hide_panel() {
     g_ui.callout_open = false;
     request_settings(false);
     for (int i = 0; i < kProviderCount; ++i) if (!g_ui.model_pinned[i]) {
+        g_ui.meter_card_open[i] = false;
         g_ui.model_open[i] = false;
         g_ui.model_detached[i] = false;
     }
@@ -1157,13 +1221,14 @@ void tick_ui(float dt) {
             logged[i] = g_app.providers[i].logged_in;
             used[i] = logged[i] ? g_app.providers[i].primary_used : 0;
             int kind = g_app.slot_kind[i];
-            shown[i] = g_app.enabled[i] && kind >= 0 && (i >= kKindCount || g_app.listed[kind]);
+        shown[i] = g_app.enabled[i] && kind >= 0 && (i >= kKindCount || g_app.listed[kind]) && (!g_ui.meter_pinned[i] || g_ui.meter_returning[i]);
         }
     }
     for (int i = 0; i < kProviderCount; ++i) {
         g_ui.used_anim[i] = approach(g_ui.used_anim[i], static_cast<float>(used[i]), dt, 10.0f);
         g_ui.hover_anim[i] = approach(g_ui.hover_anim[i], g_ui.hover_ring == i ? 1.0f : 0.0f, dt, 16.0f);
         g_ui.slot_anim[i] = approach(g_ui.slot_anim[i], shown[i] ? 1.0f : 0.0f, dt, 14.0f);
+        g_ui.meter_anim[i] = approach(g_ui.meter_anim[i], g_ui.meter_pinned[i] && !g_ui.meter_returning[i] ? 1.0f : 0.0f, dt, 14.0f);
         g_ui.reorder_anim[i] = approach(g_ui.reorder_anim[i], g_ui.reorder_slot == i ? 1.0f : 0.0f, dt, 18.0f);
     }
     g_ui.gear_hot = approach(g_ui.gear_hot, g_ui.gear_hovered ? 1.0f : 0.0f, dt, 16.0f);
@@ -1175,6 +1240,13 @@ void tick_ui(float dt) {
         if (!g_ui.model_open[i] && g_ui.model_anim[i] < 0.02f) {
             g_ui.model_detached[i] = false;
             if (prev >= 0.02f) relayout = true;
+        }
+        if (g_ui.meter_pinned[i] && g_ui.meter_returning[i] && g_ui.meter_anim[i] < 0.02f) {
+            g_ui.meter_pinned[i] = false;
+            g_ui.meter_returning[i] = false;
+            g_ui.meter_screen_x[i] = 0;
+            g_ui.meter_screen_y[i] = 0;
+            relayout = true;
         }
     }
     if (relayout) apply_layout();
@@ -1224,6 +1296,7 @@ bool global_point_over_owned_window(float x, float y) {
     if (global_point_in_window(g_ui.window, x, y)) return true;
     for (int i = 0; i < kProviderCount; ++i) {
         if (g_ui.card_window_visible[i] && global_point_in_window(g_ui.card_window[i], x, y)) return true;
+        if (g_ui.meter_card_window_visible[i] && global_point_in_window(g_ui.meter_card_window[i], x, y)) return true;
     }
     return false;
 }
@@ -1798,8 +1871,7 @@ void stroke_arc(float cx, float cy, float radius, float thickness, float t0, flo
     }
 }
 
-void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent, float opacity = 1.0f) {
-    const float thickness = 4.5f;
+void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent, float opacity = 1.0f, SDL_Color track = color(52, 52, 56), float thickness = 4.5f) {
     const int scale = 3;
     int size = static_cast<int>(std::ceil((radius + thickness + 2.0f) * 2.0f * scale));
     SDL_Surface* surface = SDL_CreateSurface(size, size, SDL_PIXELFORMAT_RGBA32);
@@ -1811,7 +1883,6 @@ void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent, 
     float orad = radius * scale;
     float othick = thickness * scale;
     float sweep = static_cast<float>(std::clamp(used, 0.0, 100.0) / 100.0 * 6.2831853f);
-    SDL_Color track = color(52, 52, 56);
     for (int py = 0; py < size; ++py) {
         for (int px = 0; px < size; ++px) {
             float dx = static_cast<float>(px) + 0.5f - ocx;
@@ -1948,7 +2019,7 @@ void draw_panel() {
     int visible = 0;
     int visible_index[kProviderCount];
     visible = collect_visible(visible_index);
-    if (visible == 0) {
+    if (visible == 0 && !g_ui.meter_pinned[selected]) {
         visible_index[0] = selected;
         visible = 1;
     }
@@ -2008,6 +2079,7 @@ void draw_panel() {
     g_ui.pin_button = {dx + 48, footer_y, 36, 36};
     draw_gear_icon(g_ui.gear_button, g_ui.gear_hot);
     draw_pin_icon(g_ui.pin_button, g_ui.pinned, g_ui.pin_hot);
+    fill_round({dx + kDockWidth * 0.5f - 7.0f, dy + dock_h - 7.0f, 14, 3}, 1.5f, 100, 100, 106, 190);
     bool left_open = left_sheet_open();
     if (left_open && g_ui.settings_anim > 0.02f) {
         Uint8 alpha = static_cast<Uint8>(std::clamp(g_ui.settings_anim, 0.0f, 1.0f) * 255.0f);
@@ -2178,8 +2250,15 @@ int card_index_for_window(SDL_WindowID window_id) {
     return -1;
 }
 
-void card_event_logical(int index, SDL_Event event, float* x, float* y) {
-    if (index < 0 || index >= kProviderCount || !g_ui.card_renderer[index] || !SDL_ConvertEventToRenderCoordinates(g_ui.card_renderer[index], &event)) {
+int meter_card_index_for_window(SDL_WindowID window_id) {
+    if (!window_id) return -1;
+    for (int i = 0; i < kProviderCount; ++i) if (g_ui.meter_card_window_id[i] == window_id) return i;
+    return -1;
+}
+
+void card_event_logical(int index, SDL_Event event, float* x, float* y, SDL_Renderer* renderer) {
+    SDL_Renderer* target = renderer ? renderer : (index >= 0 && index < kProviderCount ? g_ui.card_renderer[index] : nullptr);
+    if (index < 0 || index >= kProviderCount || !target || !SDL_ConvertEventToRenderCoordinates(target, &event)) {
         *x = event.button.x;
         *y = event.button.y;
         return;
@@ -2196,8 +2275,9 @@ void card_event_logical(int index, SDL_Event event, float* x, float* y) {
 bool create_card_window(int index) {
     if (index < 0 || index >= kProviderCount) return false;
     if (g_ui.card_window[index] && g_ui.card_renderer[index]) return true;
-    int logical_width = kCalloutWidth + kTailWidth;
-    int logical_height = callout_height_for(index) + 8;
+    bool meter_window = g_ui.meter_pinned[index];
+    int logical_width = meter_window ? kMeterWindowWidth : kCalloutWidth + kTailWidth;
+    int logical_height = meter_window ? kMeterWindowHeight : callout_height_for(index) + 8;
     int width = static_cast<int>(std::round(logical_width * g_ui.panel_scale));
     int height = static_cast<int>(std::round(logical_height * g_ui.panel_scale));
     SDL_Window* window = SDL_CreateWindow("LLM Usage Tray Card", logical_width, logical_height,
@@ -2225,6 +2305,38 @@ bool create_card_window(int index) {
     return true;
 }
 
+bool create_meter_card_window(int index) {
+    if (index < 0 || index >= kProviderCount) return false;
+    if (g_ui.meter_card_window[index] && g_ui.meter_card_renderer[index]) return true;
+    int logical_width = kCalloutWidth + kTailWidth;
+    int logical_height = callout_height_for(index) + 8;
+    int width = static_cast<int>(std::round(logical_width * g_ui.panel_scale));
+    int height = static_cast<int>(std::round(logical_height * g_ui.panel_scale));
+    SDL_Window* window = SDL_CreateWindow("LLM Usage Tray Card", logical_width, logical_height,
+        SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_TRANSPARENT | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (!window) return false;
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, nullptr);
+    if (!renderer) {
+        SDL_DestroyWindow(window);
+        return false;
+    }
+    g_ui.meter_card_window[index] = window;
+    g_ui.meter_card_renderer[index] = renderer;
+    g_ui.meter_card_window_id[index] = SDL_GetWindowID(window);
+    g_ui.meter_card_window_width[index] = width;
+    g_ui.meter_card_window_height[index] = height;
+    SDL_SetWindowFocusable(window, !g_ui.always_on_top);
+    SDL_SetWindowAlwaysOnTop(window, g_ui.always_on_top);
+    SDL_SetWindowSize(window, width, height);
+    SDL_SyncWindow(window);
+    SDL_SetRenderLogicalPresentation(renderer, logical_width, logical_height, SDL_LOGICAL_PRESENTATION_STRETCH);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderVSync(renderer, 1);
+    icons_load(renderer);
+    icons_set_renderer(g_ui.renderer);
+    return true;
+}
+
 void destroy_card_windows() {
     icons_set_renderer(g_ui.renderer);
     for (int i = 0; i < kProviderCount; ++i) {
@@ -2237,10 +2349,25 @@ void destroy_card_windows() {
         g_ui.card_window_visible[i] = false;
         g_ui.card_window_width[i] = 0;
         g_ui.card_window_height[i] = 0;
+        if (g_ui.meter_card_renderer[i]) icons_unload_renderer(g_ui.meter_card_renderer[i]);
+        if (g_ui.meter_card_renderer[i]) SDL_DestroyRenderer(g_ui.meter_card_renderer[i]);
+        if (g_ui.meter_card_window[i]) SDL_DestroyWindow(g_ui.meter_card_window[i]);
+        g_ui.meter_card_renderer[i] = nullptr;
+        g_ui.meter_card_window[i] = nullptr;
+        g_ui.meter_card_window_id[i] = 0;
+        g_ui.meter_card_window_visible[i] = false;
+        g_ui.meter_card_window_width[i] = 0;
+        g_ui.meter_card_window_height[i] = 0;
     }
 }
 
 void card_window_position(int index, int* x, int* y, bool* tail_right) {
+    if (g_ui.meter_pinned[index]) {
+        if (x) *x = g_ui.meter_screen_x[index];
+        if (y) *y = g_ui.meter_screen_y[index];
+        if (tail_right) *tail_right = true;
+        return;
+    }
     float scale = std::max(0.01f, g_ui.panel_scale);
     float card_x = static_cast<float>(g_ui.dock_anchor_x) + (callout_floating(index) ? g_ui.model_off_x[index] : snap_off_x()) * scale;
     float card_y = static_cast<float>(g_ui.dock_anchor_y) + (callout_floating(index) ? g_ui.model_off_y[index] : snap_off_y(index)) * scale;
@@ -2251,10 +2378,15 @@ void card_window_position(int index, int* x, int* y, bool* tail_right) {
     g_ui.card_local_x[index] = right || callout_floating(index) ? 0.0f : static_cast<float>(kTailWidth);
 }
 
+void meter_card_window_position(int index, int* x, int* y) {
+    if (x) *x = g_ui.meter_card_screen_x[index];
+    if (y) *y = g_ui.meter_card_screen_y[index];
+}
+
 void sync_card_windows() {
     bool wanted = !left_sheet_open();
     for (int i = 0; i < kProviderCount; ++i) {
-        bool show = wanted && g_ui.model_open[i] && (g_ui.visible || g_ui.model_pinned[i]);
+        bool show = g_ui.meter_pinned[i] || (wanted && g_ui.model_open[i] && (g_ui.visible || g_ui.model_pinned[i] || g_ui.model_detached[i]));
         if (!show) {
             if (g_ui.card_window_visible[i] && g_ui.card_window[i]) SDL_HideWindow(g_ui.card_window[i]);
             g_ui.card_window_visible[i] = false;
@@ -2264,8 +2396,9 @@ void sync_card_windows() {
         int x = 0, y = 0;
         bool tail_right = true;
         card_window_position(i, &x, &y, &tail_right);
-        int logical_width = kCalloutWidth + kTailWidth;
-        int logical_height = callout_height_for(i) + 8;
+        bool meter_window = g_ui.meter_pinned[i];
+        int logical_width = meter_window ? kMeterWindowWidth : kCalloutWidth + kTailWidth;
+        int logical_height = meter_window ? kMeterWindowHeight : callout_height_for(i) + 8;
         int width = static_cast<int>(std::round(logical_width * g_ui.panel_scale));
         int height = static_cast<int>(std::round(logical_height * g_ui.panel_scale));
         bool resized = g_ui.card_window_width[i] != width || g_ui.card_window_height[i] != height;
@@ -2292,6 +2425,72 @@ void sync_card_windows() {
             g_ui.card_raise_pending[i] = false;
         }
     }
+    for (int i = 0; i < kProviderCount; ++i) {
+        if (!g_ui.meter_card_open[i]) {
+            if (g_ui.meter_card_window_visible[i] && g_ui.meter_card_window[i]) SDL_HideWindow(g_ui.meter_card_window[i]);
+            g_ui.meter_card_window_visible[i] = false;
+            continue;
+        }
+        if (!create_meter_card_window(i)) continue;
+        int x = 0, y = 0;
+        meter_card_window_position(i, &x, &y);
+        int logical_width = kCalloutWidth + kTailWidth;
+        int logical_height = callout_height_for(i) + 8;
+        int width = static_cast<int>(std::round(logical_width * g_ui.panel_scale));
+        int height = static_cast<int>(std::round(logical_height * g_ui.panel_scale));
+        SDL_Rect usable{};
+        if (usable_bounds_for_point(x + width / 2, y + height / 2, &usable)) {
+            clamp_window_to_usable(usable, width, height, &x, &y);
+            g_ui.meter_card_screen_x[i] = x;
+            g_ui.meter_card_screen_y[i] = y;
+        }
+        bool resized = g_ui.meter_card_window_width[i] != width || g_ui.meter_card_window_height[i] != height;
+        bool moved = !g_ui.meter_card_window_visible[i] || g_ui.meter_card_window_x[i] != x || g_ui.meter_card_window_y[i] != y;
+        if (resized) {
+            SDL_SetWindowSize(g_ui.meter_card_window[i], width, height);
+            SDL_SetRenderLogicalPresentation(g_ui.meter_card_renderer[i], logical_width, logical_height, SDL_LOGICAL_PRESENTATION_STRETCH);
+            g_ui.meter_card_window_width[i] = width;
+            g_ui.meter_card_window_height[i] = height;
+        }
+        if (moved) {
+            SDL_SetWindowPosition(g_ui.meter_card_window[i], x, y);
+            g_ui.meter_card_window_x[i] = x;
+            g_ui.meter_card_window_y[i] = y;
+        }
+        if (resized || moved) SDL_SyncWindow(g_ui.meter_card_window[i]);
+        if (!g_ui.meter_card_window_visible[i]) {
+            SDL_ShowWindow(g_ui.meter_card_window[i]);
+            g_ui.meter_card_window_visible[i] = true;
+            SDL_RaiseWindow(g_ui.meter_card_window[i]);
+        }
+    }
+}
+
+void draw_meter_content(int index, const ProviderState& state) {
+    float opacity = std::clamp(g_ui.meter_anim[index], 0.0f, 1.0f);
+    Uint8 alpha = static_cast<Uint8>(std::round(opacity * 255.0f));
+    float cx = static_cast<float>(kMeterWindowWidth) * 0.5f;
+    float cy = 31.0f;
+    double used = display_percent(g_ui.used_anim[index]);
+    draw_ring(cx + 1.5f, cy + 1.5f, 24.0f, used, color(0, 0, 0), opacity * 0.5f, color(0, 0, 0), 5.25f);
+    SDL_Texture* glyph = icon_provider(std::max(0, kind_of(index)));
+    if (glyph) {
+        Uint8 shadow_alpha = static_cast<Uint8>(90.0f * opacity);
+        SDL_SetTextureColorMod(glyph, 0, 0, 0);
+        SDL_SetTextureAlphaMod(glyph, shadow_alpha);
+        icons_draw(glyph, cx + 1.5f, cy + 1.5f, 18.0f);
+        SDL_SetTextureColorMod(glyph, 255, 255, 255);
+        SDL_SetTextureAlphaMod(glyph, 255);
+    }
+    draw_ring(cx, cy, 23.0f, used, provider_accent(index), opacity);
+    draw_provider_glyph(cx, cy, index, provider_accent(index), alpha);
+    std::string pct = state.logged_in ? (std::to_string(static_cast<int>(std::round(used))) + "%") : "--";
+    auto [tw, th] = measure_text(pct, false, true);
+    float text_opacity = g_ui.draw_opacity;
+    g_ui.draw_opacity = opacity * 0.6f;
+    text(cx - tw * 0.5f + 1.0f, cy + 27.0f, pct, 0, 0, 0, false, true);
+    g_ui.draw_opacity = text_opacity;
+    text(cx - tw * 0.5f, cy + 26.0f, pct, static_cast<Uint8>(245.0f * opacity), static_cast<Uint8>(245.0f * opacity), static_cast<Uint8>(247.0f * opacity), false, true);
 }
 
 void draw_card_window(int index) {
@@ -2319,15 +2518,61 @@ void draw_card_window(int index) {
     icons_set_renderer(g_ui.renderer);
     int rw = 0, rh = 0;
     SDL_GetRenderOutputSize(g_ui.renderer, &rw, &rh);
+    bool meter_window = g_ui.meter_pinned[index];
+    float logical_width = static_cast<float>(meter_window ? kMeterWindowWidth : kCalloutWidth + kTailWidth);
+    float logical_height = static_cast<float>(meter_window ? kMeterWindowHeight : callout_height_for(state) + 8);
+    g_ui.render_scale = std::max(1.0f, std::max(rw / logical_width, rh / logical_height));
+    set_color(0, 0, 0, 0);
+    SDL_RenderClear(g_ui.renderer);
+    if (meter_window) {
+        draw_meter_content(index, state);
+        g_ui.card_pin_button[index] = {};
+    } else {
+        float transition = g_ui.dragging_model == index ? 1.0f : model_transition_progress(index);
+        Uint8 alpha = static_cast<Uint8>(std::clamp(transition * g_ui.left_anim, 0.0f, 1.0f) * 255.0f);
+        float card_y = (1.0f - transition) * 4.0f;
+        draw_model_card_content(index, g_ui.card_local_x[index], card_y, state, selected, alpha, !callout_floating(index), !callout_floating(index) ? std::optional<bool>(tail_right) : std::nullopt);
+        g_ui.card_pin_button[index] = g_ui.model_pin_button[index];
+    }
+    SDL_RenderPresent(g_ui.renderer);
+    g_ui.render_scale = previous_scale;
+    g_ui.renderer = previous;
+    g_ui.model_callout_rect[index] = previous_callout;
+    g_ui.model_pin_button[index] = previous_pin;
+    g_ui.callout_pin_button = previous_callout_pin;
+    g_ui.callout_rect = previous_card;
+    g_ui.draw_opacity = previous_opacity;
+    icons_set_renderer(g_ui.renderer);
+}
+
+void draw_meter_card_window(int index) {
+    if (index < 0 || index >= kProviderCount || !g_ui.meter_card_window_visible[index] || !g_ui.meter_card_renderer[index]) return;
+    ProviderState state;
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        state = g_app.providers[index];
+    }
+    int selected = selected_provider();
+    SDL_Renderer* previous = g_ui.renderer;
+    float previous_scale = g_ui.render_scale;
+    Rect previous_callout = g_ui.model_callout_rect[index];
+    Rect previous_pin = g_ui.model_pin_button[index];
+    Rect previous_callout_pin = g_ui.callout_pin_button;
+    Rect previous_card = g_ui.callout_rect;
+    float previous_opacity = g_ui.draw_opacity;
+    g_ui.renderer = g_ui.meter_card_renderer[index];
+    g_ui.draw_opacity = 1.0f;
+    icons_set_renderer(g_ui.renderer);
+    int rw = 0, rh = 0;
+    SDL_GetRenderOutputSize(g_ui.renderer, &rw, &rh);
     float logical_width = static_cast<float>(kCalloutWidth + kTailWidth);
     float logical_height = static_cast<float>(callout_height_for(state) + 8);
     g_ui.render_scale = std::max(1.0f, std::max(rw / logical_width, rh / logical_height));
     set_color(0, 0, 0, 0);
     SDL_RenderClear(g_ui.renderer);
-    float transition = g_ui.dragging_model == index ? 1.0f : model_transition_progress(index);
-    Uint8 alpha = static_cast<Uint8>(std::clamp(transition * g_ui.left_anim, 0.0f, 1.0f) * 255.0f);
-    float card_y = (1.0f - transition) * 4.0f;
-    draw_model_card_content(index, g_ui.card_local_x[index], card_y, state, selected, alpha, !callout_floating(index), !callout_floating(index) ? std::optional<bool>(tail_right) : std::nullopt);
+    float transition = g_ui.dragging_meter_card ? 1.0f : model_transition_progress(index);
+    Uint8 alpha = static_cast<Uint8>(std::clamp(transition, 0.0f, 1.0f) * 255.0f);
+    draw_model_card_content(index, 0, (1.0f - transition) * 4.0f, state, selected, alpha, false);
     g_ui.card_pin_button[index] = g_ui.model_pin_button[index];
     SDL_RenderPresent(g_ui.renderer);
     g_ui.render_scale = previous_scale;
@@ -2341,7 +2586,8 @@ void draw_card_window(int index) {
 }
 
 void draw_card_windows() {
-    for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_open[i]) draw_card_window(i);
+    for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_open[i] || g_ui.meter_pinned[i]) draw_card_window(i);
+    for (int i = 0; i < kProviderCount; ++i) if (g_ui.meter_card_open[i]) draw_meter_card_window(i);
 }
 
 void begin_card_drag(int index) {
@@ -2352,8 +2598,110 @@ void begin_card_drag(int index) {
     sync_card_windows();
 }
 
+bool global_point_in_dock(float x, float y) {
+    if (!g_ui.visible || !g_ui.window) return false;
+    int wx = 0, wy = 0;
+    SDL_GetWindowPosition(g_ui.window, &wx, &wy);
+    float lx = 0, ly = 0;
+    window_to_logical(x - static_cast<float>(wx), y - static_cast<float>(wy), &lx, &ly);
+    return contains(g_ui.dock_rect, lx, ly);
+}
+
+void begin_meter_return(int index) {
+    if (index < 0 || index >= kProviderCount || !g_ui.meter_pinned[index] || g_ui.meter_returning[index]) return;
+    g_ui.meter_returning[index] = true;
+    g_ui.meter_card_open[index] = false;
+    g_ui.model_open[index] = false;
+    g_ui.model_detached[index] = false;
+    if (g_ui.dragging_model == index) {
+        g_ui.dragging_model = -1;
+        g_ui.dragging_meter_card = false;
+        g_ui.drag_layout_ready = false;
+    }
+}
+
+void open_meter_card(int index) {
+    if (index < 0 || index >= kProviderCount || !g_ui.meter_pinned[index]) return;
+    float scale = std::max(0.01f, g_ui.panel_scale);
+    int meter_x = g_ui.meter_screen_x[index];
+    int meter_y = g_ui.meter_screen_y[index];
+    int meter_width = static_cast<int>(std::lround(static_cast<float>(kMeterWindowWidth) * scale));
+    int meter_height = static_cast<int>(std::lround(static_cast<float>(kMeterWindowHeight) * scale));
+    int card_width = static_cast<int>(std::lround(static_cast<float>(kCalloutWidth + kTailWidth) * scale));
+    int card_height = static_cast<int>(std::lround(static_cast<float>(callout_height_for(index) + 8) * scale));
+    int gap = std::max(8, static_cast<int>(std::lround(10.0f * scale)));
+    int right_x = meter_x + meter_width + gap;
+    int left_x = meter_x - card_width - gap;
+    int card_x = right_x;
+    int card_y = meter_y + (meter_height - card_height) / 2;
+    SDL_Rect usable{};
+    bool has_usable = usable_bounds_for_point(meter_x + meter_width / 2, meter_y + meter_height / 2, &usable);
+    if (has_usable) {
+        bool right_fits = right_x + card_width <= usable.x + usable.w;
+        bool left_fits = left_x >= usable.x;
+        if (!right_fits && left_fits) card_x = left_x;
+        else if (!right_fits && !left_fits && meter_x - usable.x > usable.x + usable.w - (meter_x + meter_width)) card_x = left_x;
+        clamp_window_to_usable(usable, card_width, card_height, &card_x, &card_y);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        g_app.selected = index;
+    }
+    g_ui.meter_card_open[index] = true;
+    g_ui.meter_returning[index] = false;
+    g_ui.model_open[index] = true;
+    g_ui.model_pinned[index] = false;
+    g_ui.model_detached[index] = true;
+    g_ui.meter_card_screen_x[index] = card_x;
+    g_ui.meter_card_screen_y[index] = card_y;
+    g_ui.model_off_x[index] = (static_cast<float>(card_x) - static_cast<float>(g_ui.dock_anchor_x)) / scale;
+    g_ui.model_off_y[index] = (static_cast<float>(card_y) - static_cast<float>(g_ui.dock_anchor_y)) / scale;
+    g_ui.card_raise_pending[index] = true;
+    g_ui.drag_moved = false;
+    sync_callout_open();
+    apply_layout();
+    sync_card_windows();
+    if (g_ui.meter_card_window[index]) SDL_RaiseWindow(g_ui.meter_card_window[index]);
+}
+
+void close_meter_card(int index) {
+    if (index < 0 || index >= kProviderCount || !g_ui.meter_card_open[index]) return;
+    g_ui.meter_card_open[index] = false;
+    g_ui.model_open[index] = false;
+    g_ui.model_detached[index] = false;
+    g_ui.card_raise_pending[index] = false;
+    sync_callout_open();
+    apply_layout();
+    sync_card_windows();
+}
+
+void end_meter_drag(int index) {
+    if (index < 0 || index >= kProviderCount || g_ui.dragging_model != index) return;
+    float gx = 0, gy = 0;
+    SDL_GetGlobalMouseState(&gx, &gy);
+    bool to_dock = global_point_in_dock(gx, gy);
+    bool click = !g_ui.drag_moved;
+    if (to_dock) begin_meter_return(index);
+    else if (click) {
+        g_ui.dragging_model = -1;
+        g_ui.drag_layout_ready = false;
+        if (g_ui.meter_card_open[index]) close_meter_card(index);
+        else open_meter_card(index);
+        return;
+    }
+    g_ui.dragging_model = -1;
+    g_ui.drag_layout_ready = false;
+    g_ui.drag_moved = false;
+    sync_card_windows();
+    apply_layout();
+}
+
 void end_card_drag(int index) {
     if (index < 0 || index >= kProviderCount || g_ui.dragging_model != index) return;
+    if (g_ui.meter_pinned[index] && !g_ui.dragging_meter_card) {
+        end_meter_drag(index);
+        return;
+    }
     g_ui.dragging_model = -1;
     g_ui.drag_layout_ready = false;
     float dx = g_ui.model_off_x[index] - snap_off_x();
@@ -2369,6 +2717,23 @@ void end_card_drag(int index) {
 
 void handle_card_mouse_down(int index, float x, float y) {
     if (index < 0 || index >= kProviderCount) return;
+    if (g_ui.meter_pinned[index]) {
+        if (g_ui.meter_returning[index]) return;
+        float gx = 0, gy = 0;
+        SDL_GetGlobalMouseState(&gx, &gy);
+        float scale = std::max(0.01f, g_ui.panel_scale);
+        g_ui.meter_press_x = gx;
+        g_ui.meter_press_y = gy;
+        g_ui.drag_moved = false;
+        g_ui.grab_x = static_cast<int>(std::round(x));
+        g_ui.grab_y = static_cast<int>(std::round(y));
+        g_ui.meter_screen_x[index] = static_cast<int>(std::lround(gx - static_cast<float>(g_ui.grab_x) * scale));
+        g_ui.meter_screen_y[index] = static_cast<int>(std::lround(gy - static_cast<float>(g_ui.grab_y) * scale));
+        g_ui.dragging_model = index;
+        g_ui.drag_layout_ready = true;
+        SDL_RaiseWindow(g_ui.card_window[index]);
+        return;
+    }
     if (contains(g_ui.card_pin_button[index], x, y)) {
         toggle_model_pin(index);
         return;
@@ -2387,9 +2752,53 @@ void handle_card_mouse_up(int index) {
     end_card_drag(index);
 }
 
+void handle_meter_card_mouse_down(int index, float x, float y) {
+    if (index < 0 || index >= kProviderCount || !g_ui.meter_card_open[index]) return;
+    if (contains(g_ui.card_pin_button[index], x, y)) {
+        toggle_model_pin(index);
+        return;
+    }
+    float gx = 0, gy = 0;
+    SDL_GetGlobalMouseState(&gx, &gy);
+    float scale = std::max(0.01f, g_ui.panel_scale);
+    g_ui.meter_press_x = gx;
+    g_ui.meter_press_y = gy;
+    g_ui.drag_moved = false;
+    g_ui.grab_x = static_cast<int>(std::round(x));
+    g_ui.grab_y = static_cast<int>(std::round(y));
+    g_ui.meter_card_screen_x[index] = static_cast<int>(std::lround(gx - static_cast<float>(g_ui.grab_x) * scale));
+    g_ui.meter_card_screen_y[index] = static_cast<int>(std::lround(gy - static_cast<float>(g_ui.grab_y) * scale));
+    g_ui.dragging_model = index;
+    g_ui.dragging_meter_card = true;
+    g_ui.drag_layout_ready = true;
+    SDL_RaiseWindow(g_ui.meter_card_window[index]);
+}
+
+void handle_meter_card_mouse_up(int index) {
+    if (index < 0 || index >= kProviderCount || g_ui.dragging_model != index || !g_ui.dragging_meter_card) return;
+    g_ui.dragging_model = -1;
+    g_ui.dragging_meter_card = false;
+    g_ui.drag_layout_ready = false;
+    g_ui.drag_moved = false;
+    sync_card_windows();
+}
+
+void recall_meters() {
+    bool changed = false;
+    for (int i = 0; i < kProviderCount; ++i) {
+        if (!g_ui.meter_pinned[i] || g_ui.meter_returning[i]) continue;
+        begin_meter_return(i);
+        changed = true;
+    }
+    if (!changed) return;
+    apply_layout();
+    sync_card_windows();
+}
+
 void on_tray_show(void*, SDL_TrayEntry*) { g_show_requested = true; }
 void on_tray_refresh(void*, SDL_TrayEntry*) { g_refresh_requested = true; }
 void on_tray_warm(void*, SDL_TrayEntry*) { g_warm_requested = true; }
+void on_tray_recall(void*, SDL_TrayEntry*) { recall_meters(); }
 void on_tray_quit(void*, SDL_TrayEntry*) { g_quit = true; }
 
 bool on_tray_left_click(void*, SDL_Tray*) {
@@ -2439,6 +2848,8 @@ void create_tray() {
         if (show) SDL_SetTrayEntryCallback(show, on_tray_show, nullptr);
         SDL_TrayEntry* refresh = menu ? SDL_InsertTrayEntryAt(menu, -1, "Refresh", SDL_TRAYENTRY_BUTTON) : nullptr;
         if (refresh) SDL_SetTrayEntryCallback(refresh, on_tray_refresh, nullptr);
+        SDL_TrayEntry* recall = menu ? SDL_InsertTrayEntryAt(menu, -1, "Recall meters", SDL_TRAYENTRY_BUTTON) : nullptr;
+        if (recall) SDL_SetTrayEntryCallback(recall, on_tray_recall, nullptr);
         SDL_TrayEntry* quit = menu ? SDL_InsertTrayEntryAt(menu, -1, "Quit", SDL_TRAYENTRY_BUTTON) : nullptr;
         if (quit) SDL_SetTrayEntryCallback(quit, on_tray_quit, nullptr);
     }
@@ -2644,6 +3055,12 @@ void remove_provider_slot(int index) {
         g_app.enabled[index] = false;
         g_ui.model_open[index] = false;
     }
+    g_ui.meter_pinned[index] = false;
+    g_ui.meter_returning[index] = false;
+    g_ui.meter_card_open[index] = false;
+    g_ui.meter_anim[index] = 0;
+    g_ui.meter_screen_x[index] = 0;
+    g_ui.meter_screen_y[index] = 0;
     g_ui.confirm_open = false;
     g_ui.confirm_index = -1;
     save_layout();
@@ -2677,6 +3094,13 @@ int alloc_slot(int kind, int acct = -1) {
 }
 
 void toggle_model_pin(int index) {
+    if (g_ui.meter_card_open[index]) {
+        float scale = std::max(0.01f, g_ui.panel_scale);
+        g_ui.model_off_x[index] = (static_cast<float>(g_ui.meter_card_screen_x[index]) - static_cast<float>(g_ui.dock_anchor_x)) / scale;
+        g_ui.model_off_y[index] = (static_cast<float>(g_ui.meter_card_screen_y[index]) - static_cast<float>(g_ui.dock_anchor_y)) / scale;
+        g_ui.meter_card_open[index] = false;
+        g_ui.meter_pinned[index] = false;
+    }
     g_ui.model_open[index] = true;
     g_ui.card_raise_pending[index] = true;
     g_ui.model_pinned[index] = !g_ui.model_pinned[index];
@@ -3027,13 +3451,15 @@ void handle_mouse_motion() {
                 if (j != index && model_is_snapped(j)) g_ui.model_open[j] = false;
             }
             float scale = std::max(0.01f, g_ui.panel_scale);
-            g_ui.model_open[index] = true;
-            g_ui.model_detached[index] = true;
-            g_ui.callout_open = true;
-            g_ui.grab_x = kCalloutWidth - 24;
-            g_ui.grab_y = 24;
-            g_ui.model_off_x[index] = (gx - static_cast<float>(g_ui.grab_x) * scale - static_cast<float>(g_ui.dock_anchor_x)) / scale;
-            g_ui.model_off_y[index] = (gy - static_cast<float>(g_ui.grab_y) * scale - static_cast<float>(g_ui.dock_anchor_y)) / scale;
+            g_ui.model_open[index] = false;
+            g_ui.model_pinned[index] = false;
+            g_ui.model_detached[index] = false;
+            g_ui.meter_pinned[index] = true;
+            g_ui.grab_x = kMeterWindowWidth / 2;
+            g_ui.grab_y = kMeterWindowHeight / 2;
+            g_ui.meter_screen_x[index] = static_cast<int>(std::lround(gx - static_cast<float>(g_ui.grab_x) * scale));
+            g_ui.meter_screen_y[index] = static_cast<int>(std::lround(gy - static_cast<float>(g_ui.grab_y) * scale));
+            sync_callout_open();
             g_ui.dragging_model = index;
             g_ui.drag_layout_ready = true;
             if (provider_has_auth(index)) refresh_usage_async_for(index, false);
@@ -3044,6 +3470,24 @@ void handle_mouse_motion() {
     if (g_ui.dragging_model >= 0) {
         int index = g_ui.dragging_model;
         float scale = std::max(0.01f, g_ui.panel_scale);
+        if (g_ui.dragging_meter_card) {
+            float move_x = gx - g_ui.meter_press_x;
+            float move_y = gy - g_ui.meter_press_y;
+            if (move_x * move_x + move_y * move_y > 36.0f * scale * scale) g_ui.drag_moved = true;
+            g_ui.meter_card_screen_x[index] = static_cast<int>(std::lround(gx - static_cast<float>(g_ui.grab_x) * scale));
+            g_ui.meter_card_screen_y[index] = static_cast<int>(std::lround(gy - static_cast<float>(g_ui.grab_y) * scale));
+            sync_card_windows();
+            return;
+        }
+        if (g_ui.meter_pinned[index] && !g_ui.dragging_meter_card) {
+            float move_x = gx - g_ui.meter_press_x;
+            float move_y = gy - g_ui.meter_press_y;
+            if (move_x * move_x + move_y * move_y > 36.0f * scale * scale) g_ui.drag_moved = true;
+            g_ui.meter_screen_x[index] = static_cast<int>(std::lround(gx - static_cast<float>(g_ui.grab_x) * scale));
+            g_ui.meter_screen_y[index] = static_cast<int>(std::lround(gy - static_cast<float>(g_ui.grab_y) * scale));
+            sync_card_windows();
+            return;
+        }
         g_ui.model_off_x[index] = (gx - static_cast<float>(g_ui.grab_x) * scale - static_cast<float>(g_ui.dock_anchor_x)) / scale;
         g_ui.model_off_y[index] = (gy - static_cast<float>(g_ui.grab_y) * scale - static_cast<float>(g_ui.dock_anchor_y)) / scale;
         float dx = g_ui.model_off_x[index] - snap_off_x();
@@ -3276,11 +3720,29 @@ int main(int argc, char** argv) {
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) event_window = event.button.windowID;
             else if (event.type == SDL_EVENT_MOUSE_MOTION) event_window = event.motion.windowID;
             else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST || event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) event_window = event.window.windowID;
+            int meter_card_index = meter_card_index_for_window(event_window);
+            if (meter_card_index >= 0) {
+                if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
+                    card_event_logical(meter_card_index, event, &ex, &ey, g_ui.meter_card_renderer[meter_card_index]);
+                    handle_meter_card_mouse_down(meter_card_index, ex, ey);
+                } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
+                    handle_mouse_motion();
+                } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
+                    handle_meter_card_mouse_up(meter_card_index);
+                }
+                continue;
+            }
             int card_index = card_index_for_window(event_window);
             if (card_index >= 0) {
                 if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
                     card_event_logical(card_index, event, &ex, &ey);
                     handle_card_mouse_down(card_index, ex, ey);
+                } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_RIGHT) {
+                    if (g_ui.meter_pinned[card_index]) {
+                        begin_meter_return(card_index);
+                        apply_layout();
+                        sync_card_windows();
+                    }
                 } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
                     handle_mouse_motion();
                 } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
@@ -3357,7 +3819,10 @@ int main(int argc, char** argv) {
         poll_update_install_result();
         if (g_refresh_requested.exchange(false)) refresh_usage_async_for(selected_provider(), true);
         if (g_warm_requested.exchange(false)) warm_async_for(selected_provider());
-        if (g_ui.dragging_model >= 0 && !(SDL_GetGlobalMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK)) end_card_drag(g_ui.dragging_model);
+        if (g_ui.dragging_model >= 0 && !(SDL_GetGlobalMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK)) {
+            if (g_ui.dragging_meter_card) handle_meter_card_mouse_up(g_ui.dragging_model);
+            else end_card_drag(g_ui.dragging_model);
+        }
         sync_card_windows();
 
         if (g_ui.visible && g_ui.dragging_model < 0 && g_ui.reorder_slot < 0 && g_ui.pending_ring < 0) {
@@ -3392,12 +3857,14 @@ int main(int argc, char** argv) {
         long long tick_now = now_ms();
         float dt = std::clamp(static_cast<float>(tick_now - last_tick) / 1000.0f, 0.001f, 0.05f);
         last_tick = tick_now;
+        bool cards_open = false;
+        for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_open[i] || g_ui.meter_pinned[i]) { cards_open = true; break; }
+        if (g_ui.visible || cards_open) tick_ui(dt);
         if (g_ui.visible) {
-            tick_ui(dt);
             poll_dismiss();
             draw_panel();
-            draw_card_windows();
         }
+        if (g_ui.visible || cards_open) draw_card_windows();
         SDL_Delay(16);
     }
 

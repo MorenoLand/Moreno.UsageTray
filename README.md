@@ -21,6 +21,7 @@ Backend notes:
 
 - Credentials are saved through the platform's local credential store.
 - Linux users need a working tray/status notifier environment.
+- Provider icons and the SDL rendering path are packaged for Windows, macOS, and Linux builds.
 
 ## Security
 
@@ -75,11 +76,28 @@ The popup is a compact ring dock plus a detail card:
 
 - one ring per enabled provider, showing that provider's primary window as percent remaining by default (toggleable to used)
 - click a ring for the callout (session/CLI and weekly/Bot bars, reset times)
-- gear opens Settings to enable providers, sign in or out, and refresh
-- pin keeps the popup open; drag the cards to reposition
-- Window mode can keep the dock above other windows or leave it as a desktop widget
-- Settings can check for releases and install the matching platform update
+- the dock and detail cards are separate transparent windows, so cards can be moved without changing the dock or blocking unrelated applications
+- gear opens Settings to enable providers, add model slots, sign in or out, remove models with confirmation, and refresh
+- pin the dock independently; pin cards independently; drag the dock or any card anywhere on the monitor
+- reorder rings by dragging them vertically inside the dock
+- Window mode can keep the dock above other windows or leave it as a desktop widget; newly opened widgets/cards are focused first
 - right-click the dock to toggle Settings
+
+### Detached meters
+
+- drag a ring out of the dock to create a compact, movable meter; the ring fades out of the dock and the dock resizes when no rings remain
+- click a detached meter to open its full card beside it; the card chooses the side with available monitor space and clamps to the usable work area
+- click the meter again to close its card while keeping the meter detached
+- drag a meter back over the dock, or right-click it, to return it with a fade/materialize animation
+- the tray menu includes `Recall meters` to return every detached meter at once
+
+### Settings and tray controls
+
+- Show remaining/Show used display mode
+- refresh intervals of 30 seconds, 45 seconds, 1 minute, 5 minutes, 15 minutes, 30 minutes, or 60 minutes
+- UI scale, 12-hour/24-hour time format, and Always on top/Desktop widget mode
+- automatic update checking, manual `Check now`, and a version watermark in the Settings sheet
+- tray actions for Show, Refresh, Recall meters, and Quit
 
 GLM uses:
 
@@ -134,7 +152,7 @@ emit diagnostics.
 
 ## Updates
 
-The release workflow publishes `latest.json` with the current version, platform binary URLs, and executable SHA-256 values. The Settings update controls download, verify, and install that binary through a helper restart.
+The release workflow publishes `latest.json` with the current version, platform binary URLs, and executable SHA-256 values. The app checks it automatically when enabled or from Settings, compares both the version and executable hash, and offers an ignore-this-version option. Accepting an update downloads the matching raw platform binary with a progress bar, verifies its SHA-256, swaps it through a helper process, and restarts the app automatically.
 
 ## License
 
