@@ -75,6 +75,7 @@ constexpr int kUpdateDialogHeight = 206;
 constexpr int kUpdateInstallingHeight = 154;
 constexpr int kMeterWindowWidth = 84;
 constexpr int kMeterWindowHeight = 76;
+constexpr int kTrayIconBaseSize = 16;
 constexpr int kDefaultRefreshIntervalSeconds = 300;
 constexpr float kDefaultUiScale = 1.0f;
 constexpr int kKindCount = 5;
@@ -147,6 +148,11 @@ struct UiState {
     Rect card_pin_button[kProviderCount];
     SDL_Tray* tray = nullptr;
     SDL_Surface* icon = nullptr;
+    int tray_main_model = -1;
+    int tray_icon_model = -2;
+    int tray_icon_percent = -2;
+    bool tray_icon_logged = false;
+    bool tray_icon_remaining = true;
     TTF_Font* font = nullptr;
     TTF_Font* font_bold = nullptr;
     TTF_Font* font_small = nullptr;
@@ -219,6 +225,7 @@ struct UiState {
     int dock_anchor_y = 0;
     Rect settings_toggle[kProviderCount];
     Rect settings_action[kProviderCount];
+    Rect settings_star[kProviderCount];
     Rect settings_add[kKindCount];
     Rect settings_remove[kProviderCount];
     Rect settings_add_kind[kKindCount];
@@ -757,7 +764,7 @@ bool over_click_target(float x, float y) {
     }
     if (g_ui.settings_open) {
         for (int i = 0; i < kProviderCount; ++i) {
-            if (contains(g_ui.settings_toggle[i], x, y) || contains(g_ui.settings_action[i], x, y)) return true;
+            if (contains(g_ui.settings_toggle[i], x, y) || contains(g_ui.settings_action[i], x, y) || contains(g_ui.settings_star[i], x, y)) return true;
         }
         return contains(g_ui.settings_quit, x, y) || contains(g_ui.settings_refresh, x, y) || contains(g_ui.settings_fill_toggle, x, y) || contains(g_ui.settings_refresh_interval, x, y) || contains(g_ui.settings_scale, x, y) || contains(g_ui.settings_time_format, x, y) || contains(g_ui.settings_window_mode, x, y) || contains(g_ui.settings_update_toggle, x, y) || contains(g_ui.settings_check_updates, x, y) || contains(g_ui.callout_rect, x, y);
     }
@@ -1014,6 +1021,7 @@ void handle_card_mouse_up(int index);
 int card_index_for_window(SDL_WindowID window_id);
 void card_event_logical(int index, SDL_Event event, float* x, float* y, SDL_Renderer* renderer = nullptr);
 void toggle_model_pin(int index);
+void sync_tray_icon();
 
 void apply_layout() {
     float scale = std::max(0.01f, g_ui.panel_scale);
@@ -1949,6 +1957,16 @@ void draw_pin_icon(Rect r, bool on, float = 0) {
     }
 }
 
+void draw_star_icon(Rect r, bool on) {
+    SDL_Texture* texture = icon_star();
+    if (!texture) return;
+    SDL_SetTextureColorMod(texture, on ? 255 : 108, on ? 204 : 108, on ? 72 : 116);
+    SDL_SetTextureAlphaMod(texture, static_cast<Uint8>(255.0f * std::clamp(g_ui.draw_opacity, 0.0f, 1.0f)));
+    icons_draw(texture, r.x + r.w * 0.5f, r.y + r.h * 0.5f, 18.0f);
+    SDL_SetTextureColorMod(texture, 255, 255, 255);
+    SDL_SetTextureAlphaMod(texture, 255);
+}
+
 void draw_status_dot(float x, float y, bool on) {
     fill_round({x, y, 7, 7}, 3.5f, on ? 48 : 72, on ? 209 : 72, on ? 88 : 76);
 }
@@ -2061,6 +2079,7 @@ void draw_panel() {
     for (int i = 0; i < kProviderCount; ++i) {
         g_ui.model_callout_rect[i] = {};
         g_ui.model_pin_button[i] = {};
+        g_ui.settings_star[i] = {};
     }
     aa_round_rect(g_ui.dock_rect, static_cast<float>(kDockRadius), color(18, 18, 20));
     for (int slot = 0; slot < kProviderCount; ++slot) g_ui.ring_slots[slot] = {};
@@ -2170,6 +2189,8 @@ void draw_panel() {
                     if (acct_of(slot) > 0) title += " " + std::to_string(acct_of(slot) + 1);
                     text(card_x + 48, y + 8, title, 245, 245, 247, true, true);
                     text(card_x + 48, y + 26, states[slot].logged_in ? (states[slot].account_label.empty() ? "Connected" : clip_text(states[slot].account_label, 110, false, true)) : "Not signed in", 142, 142, 147, false, true);
+                    g_ui.settings_star[slot] = {card_x + 116, y + 10, 28, 28};
+                    draw_star_icon(g_ui.settings_star[slot], g_ui.tray_main_model == slot);
                     g_ui.settings_toggle[slot] = {card_x + 156, y + 12, 36, 24};
                     aa_round_rect(g_ui.settings_toggle[slot], 12, enabled[slot] ? color(48, 209, 88) : color(58, 58, 62), enabled[slot] ? color(48, 209, 88) : color(58, 58, 62));
                     fill_round({g_ui.settings_toggle[slot].x + (enabled[slot] ? 18.0f : 4.0f), y + 16, 16, 16}, 8, 245, 245, 247);
@@ -2823,26 +2844,146 @@ bool on_tray_right_click(void*, SDL_Tray*) {
     return false;
 }
 
-SDL_Surface* make_icon_surface(int size) {
+void draw_tray_meter_mark(SDL_Surface* surface, int provider_index, int progress) {
+    int size = surface->w;
+    if (progress >= 0) {
+        static const char* large[10][7] = {
+            {"01110", "10001", "10011", "10101", "11001", "10001", "01110"},
+            {"00100", "01100", "00100", "00100", "00100", "00100", "01110"},
+            {"01110", "10001", "00001", "00010", "00100", "01000", "11111"},
+            {"11110", "00001", "00001", "01110", "00001", "00001", "11110"},
+            {"00010", "00110", "01010", "10010", "11111", "00010", "00010"},
+            {"11111", "10000", "10000", "11110", "00001", "00001", "11110"},
+            {"01110", "10000", "10000", "11110", "10001", "10001", "01110"},
+            {"11111", "00001", "00010", "00100", "01000", "01000", "01000"},
+            {"01110", "10001", "10001", "01110", "10001", "10001", "01110"},
+            {"01110", "10001", "10001", "01111", "00001", "00001", "01110"}
+        };
+        static const char* small[10][5] = {
+            {"111", "101", "101", "101", "111"}, {"010", "110", "010", "010", "111"}, {"110", "001", "010", "100", "111"},
+            {"110", "001", "010", "001", "110"}, {"101", "101", "111", "001", "001"}, {"111", "100", "110", "001", "110"},
+            {"011", "100", "111", "101", "111"}, {"111", "001", "010", "010", "010"}, {"111", "101", "111", "101", "111"},
+            {"111", "101", "111", "001", "110"}
+        };
+        std::string digits = std::to_string(progress);
+        bool compact = digits.size() >= 3;
+        int glyph_width = compact ? 3 : 5;
+        int glyph_height = compact ? 5 : 7;
+        int spacing = compact ? 1 : 1;
+        int scale = std::max(1, size / 16);
+        float ring_radius = static_cast<float>(size) * 0.43f;
+        float ring_thickness = std::max(1.0f, static_cast<float>(size) * 0.09f);
+        int max_text = std::max(1, static_cast<int>(std::lround(2.0f * (ring_radius - ring_thickness * 0.5f))));
+        while (scale > 1 && (static_cast<int>(digits.size()) * glyph_width + (static_cast<int>(digits.size()) - 1) * spacing) * scale > max_text) --scale;
+        int width = (static_cast<int>(digits.size()) * glyph_width + (static_cast<int>(digits.size()) - 1) * spacing) * scale;
+        int height = glyph_height * scale;
+        auto* pixels = static_cast<Uint32*>(surface->pixels);
+        int stride = surface->pitch / static_cast<int>(sizeof(Uint32));
+        Uint32 white = SDL_MapSurfaceRGBA(surface, 245, 245, 247, 255);
+        int origin_x = (size - width) / 2;
+        int origin_y = (size - height) / 2;
+        for (std::size_t digit = 0; digit < digits.size(); ++digit) {
+            int value = digits[digit] - '0';
+            for (int row = 0; row < glyph_height; ++row) for (int col = 0; col < glyph_width; ++col) {
+                bool on = compact ? small[value][row][col] == '1' : large[value][row][col] == '1';
+                if (!on) continue;
+                for (int sy = 0; sy < scale; ++sy) for (int sx = 0; sx < scale; ++sx) pixels[(origin_y + row * scale + sy) * stride + origin_x + static_cast<int>(digit) * (glyph_width + spacing) * scale + col * scale + sx] = white;
+            }
+        }
+        return;
+    }
+    if (!g_ui.font_small_bold) return;
+    float previous_size = TTF_GetFontSize(g_ui.font_small_bold);
+    std::string label = provider_label(provider_index);
+    std::string mark = progress >= 0 ? std::to_string(progress) : (label.empty() ? "?" : label.substr(0, 1));
+    float font_scale = mark.size() >= 3 ? 0.48f : 0.68f;
+    TTF_SetFontSize(g_ui.font_small_bold, static_cast<float>(size) * font_scale);
+    SDL_Surface* glyph = TTF_RenderText_Blended(g_ui.font_small_bold, mark.c_str(), mark.size(), color(245, 245, 247));
+    if (!glyph) {
+        TTF_SetFontSize(g_ui.font_small_bold, previous_size);
+        return;
+    }
+    float ring_radius = static_cast<float>(size) * 0.43f;
+    float ring_thickness = std::max(1.0f, static_cast<float>(size) * 0.09f);
+    float text_margin = size <= 24 ? 1.0f : 8.0f;
+    int max_text_size = std::max(1, static_cast<int>(std::lround(2.0f * (ring_radius - ring_thickness * 0.5f) - text_margin)));
+    auto fit = [&](SDL_Surface* input) {
+        if (input->w <= max_text_size && input->h <= max_text_size) return input;
+        float factor = std::min(static_cast<float>(max_text_size) / static_cast<float>(input->w), static_cast<float>(max_text_size) / static_cast<float>(input->h));
+        SDL_Surface* scaled = SDL_ScaleSurface(input, std::max(1, static_cast<int>(std::lround(input->w * factor))), std::max(1, static_cast<int>(std::lround(input->h * factor))), SDL_SCALEMODE_LINEAR);
+        SDL_DestroySurface(input);
+        return scaled;
+    };
+    glyph = fit(glyph);
+    if (!glyph) {
+        TTF_SetFontSize(g_ui.font_small_bold, previous_size);
+        return;
+    }
+    SDL_Rect dst{(size - glyph->w) / 2, (size - glyph->h) / 2 - 1, glyph->w, glyph->h};
+    SDL_BlitSurface(glyph, nullptr, surface, &dst);
+    SDL_DestroySurface(glyph);
+    TTF_SetFontSize(g_ui.font_small_bold, previous_size);
+}
+
+void draw_tray_meter_surface(SDL_Surface* surface, int provider_index, int progress) {
+    int size = surface->w;
+    auto* pixels = static_cast<Uint32*>(surface->pixels);
+    int stride = surface->pitch / static_cast<int>(sizeof(Uint32));
+    SDL_Color accent = provider_accent(provider_index);
+    SDL_Color track = color(58, 58, 64);
+    float cx = static_cast<float>(size) * 0.5f;
+    float cy = static_cast<float>(size) * 0.5f;
+    float radius = static_cast<float>(size) * 0.40f;
+    float thickness = std::max(1.75f, static_cast<float>(size) * 0.13f);
+    float sweep = progress >= 0 ? static_cast<float>(std::clamp(progress, 0, 100) / 100.0 * 6.2831853) : 0.0f;
+    for (int py = 0; py < size; ++py) {
+        for (int px = 0; px < size; ++px) {
+            float dx = static_cast<float>(px) + 0.5f - cx;
+            float dy = static_cast<float>(py) + 0.5f - cy;
+            float distance = std::sqrt(dx * dx + dy * dy);
+            float coverage = std::clamp(thickness * 0.5f + 0.45f - std::abs(distance - radius), 0.0f, 1.0f);
+            if (coverage <= 0.01f) continue;
+            float angle = std::atan2(dx, -dy);
+            if (angle < 0) angle += 6.2831853f;
+            bool active = progress > 0 && (progress >= 100 || angle <= sweep);
+            SDL_Color c = active ? accent : track;
+            pixels[py * stride + px] = SDL_MapSurfaceRGBA(surface, c.r, c.g, c.b, static_cast<Uint8>(coverage * 255.0f));
+        }
+    }
+}
+
+int tray_icon_size() {
+#if defined(_WIN32)
+    return std::max(kTrayIconBaseSize, GetSystemMetrics(SM_CXSMICON));
+#else
+    return kTrayIconBaseSize;
+#endif
+}
+
+SDL_Surface* make_icon_surface(int size, int provider_index = -1, int progress = -1) {
     SDL_Surface* icon = SDL_CreateSurface(size, size, SDL_PIXELFORMAT_RGBA32);
     if (!icon) return nullptr;
     SDL_ClearSurface(icon, 0, 0, 0, 0);
-    Uint32 bg = SDL_MapSurfaceRGBA(icon, 23, 26, 28, 255);
-    Uint32 green = SDL_MapSurfaceRGBA(icon, 68, 188, 126, 255);
-    Uint32 blue = SDL_MapSurfaceRGBA(icon, 82, 145, 224, 255);
-    fill_surface_round(icon, size, size, std::max(4, size / 5), bg);
-    int margin = std::max(5, size / 5);
-    int bar_h = std::max(3, size / 8);
-    int bar_w = size - margin * 2;
-    SDL_Rect bar1{margin, size / 3 - bar_h / 2, bar_w, bar_h};
-    SDL_Rect bar2{margin, size * 2 / 3 - bar_h / 2, bar_w * 3 / 4, bar_h};
-    fill_surface_rect(icon, bar1, green);
-    fill_surface_rect(icon, bar2, blue);
+    if (provider_index >= 0) {
+        draw_tray_meter_surface(icon, provider_index, progress);
+    } else {
+        Uint32 bg = SDL_MapSurfaceRGBA(icon, 23, 26, 28, 255);
+        Uint32 green = SDL_MapSurfaceRGBA(icon, 68, 188, 126, 255);
+        Uint32 blue = SDL_MapSurfaceRGBA(icon, 82, 145, 224, 255);
+        fill_surface_round(icon, size, size, std::max(4, size / 5), bg);
+        int margin = std::max(5, size / 5);
+        int bar_h = std::max(3, size / 8);
+        int bar_w = size - margin * 2;
+        SDL_Rect bar1{margin, size / 3 - bar_h / 2, bar_w, bar_h};
+        SDL_Rect bar2{margin, size * 2 / 3 - bar_h / 2, bar_w * 3 / 4, bar_h};
+        fill_surface_rect(icon, bar1, green);
+        fill_surface_rect(icon, bar2, blue);
+    }
     return icon;
 }
 
 void create_tray() {
-    g_ui.icon = make_icon_surface(32);
+    g_ui.icon = make_icon_surface(tray_icon_size());
     if (g_ui.icon) SDL_SetWindowIcon(g_ui.window, g_ui.icon);
 #ifdef SDL_PROP_TRAY_CREATE_LEFTCLICK_CALLBACK_POINTER
     SDL_PropertiesID props = SDL_CreateProperties();
@@ -2867,6 +3008,39 @@ void create_tray() {
     }
 }
 
+void sync_tray_icon() {
+    int model = g_ui.tray_main_model;
+    if (model >= 0 && !slot_live(model)) {
+        g_ui.tray_main_model = -1;
+        model = -1;
+    }
+    bool logged = false;
+    int percent = -1;
+    if (model >= 0) {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        const auto& state = g_app.providers[model];
+        logged = state.logged_in;
+        if (logged) percent = static_cast<int>(std::round(display_percent(state.primary_used)));
+    }
+    if (model == g_ui.tray_icon_model && percent == g_ui.tray_icon_percent && logged == g_ui.tray_icon_logged && g_ui.tray_icon_remaining == g_ui.show_remaining) return;
+    SDL_Surface* next = make_icon_surface(tray_icon_size(), model, percent);
+    if (!next) return;
+    SDL_Surface* previous = g_ui.icon;
+    g_ui.icon = next;
+    if (g_ui.tray) SDL_SetTrayIcon(g_ui.tray, next);
+    if (g_ui.window) SDL_SetWindowIcon(g_ui.window, next);
+    if (g_ui.tray) {
+        std::string tooltip = "LLM Usage Tray";
+        if (model >= 0) tooltip = std::string(provider_label(model)) + (percent >= 0 ? " - " + std::to_string(percent) + (g_ui.show_remaining ? "% remaining" : "% used") : " - no usage yet");
+        SDL_SetTrayTooltip(g_ui.tray, tooltip.c_str());
+    }
+    if (previous) SDL_DestroySurface(previous);
+    g_ui.tray_icon_model = model;
+    g_ui.tray_icon_percent = percent;
+    g_ui.tray_icon_logged = logged;
+    g_ui.tray_icon_remaining = g_ui.show_remaining;
+}
+
 void save_layout() {
     std::string json = "{";
     {
@@ -2885,6 +3059,7 @@ void save_layout() {
     json += ",\"ui_scale\":" + std::to_string(g_ui.ui_scale);
     json += ",\"time_24h\":" + std::string(g_ui.use_24_hour ? "1" : "0");
     json += ",\"always_on_top\":" + std::string(g_ui.always_on_top ? "1" : "0");
+    json += ",\"tray_main\":" + std::to_string(g_ui.tray_main_model);
     json += ",\"update_check\":" + std::string(g_ui.update_check_enabled ? "1" : "0");
     json += ",\"update_ignored\":\"" + json_escape(g_ui.update_ignored_version) + "\"";
     json += "}";
@@ -3323,6 +3498,13 @@ void handle_click(float x, float y) {
             return;
         }
         for (int i = 0; i < kProviderCount; ++i) {
+            if (!contains(g_ui.settings_star[i], x, y)) continue;
+            g_ui.tray_main_model = g_ui.tray_main_model == i ? -1 : i;
+            save_layout();
+            sync_tray_icon();
+            return;
+        }
+        for (int i = 0; i < kProviderCount; ++i) {
             if (contains(g_ui.settings_toggle[i], x, y)) {
                 {
                     std::lock_guard<std::mutex> lock(g_app.mutex);
@@ -3573,6 +3755,10 @@ void load_layout() {
     }
     if (auto time = json_number(*raw, "time_24h")) g_ui.use_24_hour = *time != 0;
     if (auto top = json_number(*raw, "always_on_top")) g_ui.always_on_top = *top != 0;
+    if (auto main = json_number(*raw, "tray_main")) {
+        int value = static_cast<int>(*main);
+        if (value >= 0 && value < kProviderCount) g_ui.tray_main_model = value;
+    }
     if (auto updates = json_number(*raw, "update_check")) g_ui.update_check_enabled = *updates != 0;
     g_ui.update_ignored_version = json_string(*raw, "update_ignored").value_or("");
     std::lock_guard<std::mutex> lock(g_app.mutex);
@@ -3716,6 +3902,7 @@ int main(int argc, char** argv) {
     icons_load(g_ui.renderer);
 
     create_tray();
+    sync_tray_icon();
     if (g_ui.update_check_enabled) start_update_check(false);
     for (int i = 0; i < kProviderCount; ++i) {
         if (provider_has_auth(i)) refresh_usage_async_for(i, true);
@@ -3830,6 +4017,7 @@ int main(int argc, char** argv) {
         else if (g_show_requested) show_panel();
         poll_update_check_result();
         poll_update_install_result();
+        sync_tray_icon();
         if (g_refresh_requested.exchange(false)) refresh_usage_async_for(selected_provider(), true);
         if (g_warm_requested.exchange(false)) warm_async_for(selected_provider());
         if (g_ui.dragging_model >= 0 && !(SDL_GetGlobalMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK)) {
