@@ -971,15 +971,31 @@ void set_target_height(int height, bool immediate = false) {
     update_window_shape();
 }
 
+void reassert_window_z_order(SDL_Window* window) {
+#if defined(_WIN32)
+    if (!window || !g_ui.always_on_top) return;
+    HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+    if (!hwnd || !IsWindowVisible(hwnd)) return;
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+#else
+    (void)window;
+#endif
+}
+
 void apply_window_mode() {
-    if (g_ui.window) SDL_SetWindowAlwaysOnTop(g_ui.window, g_ui.always_on_top);
+    if (g_ui.window) {
+        SDL_SetWindowAlwaysOnTop(g_ui.window, g_ui.always_on_top);
+        reassert_window_z_order(g_ui.window);
+    }
     for (int i = 0; i < kProviderCount; ++i) if (g_ui.card_window[i]) {
         SDL_SetWindowAlwaysOnTop(g_ui.card_window[i], g_ui.always_on_top);
         SDL_SetWindowFocusable(g_ui.card_window[i], !g_ui.always_on_top);
+        reassert_window_z_order(g_ui.card_window[i]);
     }
     for (int i = 0; i < kProviderCount; ++i) if (g_ui.meter_card_window[i]) {
         SDL_SetWindowAlwaysOnTop(g_ui.meter_card_window[i], g_ui.always_on_top);
         SDL_SetWindowFocusable(g_ui.meter_card_window[i], !g_ui.always_on_top);
+        reassert_window_z_order(g_ui.meter_card_window[i]);
     }
 }
 
@@ -2418,6 +2434,7 @@ void meter_card_window_position(int index, int* x, int* y) {
 
 void sync_card_windows() {
     bool wanted = !left_sheet_open();
+    reassert_window_z_order(g_ui.window);
     for (int i = 0; i < kProviderCount; ++i) {
         bool show = g_ui.meter_pinned[i] || (wanted && g_ui.model_open[i] && (g_ui.visible || g_ui.model_pinned[i] || g_ui.model_detached[i]));
         if (!show) {
@@ -2457,6 +2474,7 @@ void sync_card_windows() {
             SDL_RaiseWindow(g_ui.card_window[i]);
             g_ui.card_raise_pending[i] = false;
         }
+        reassert_window_z_order(g_ui.card_window[i]);
     }
     for (int i = 0; i < kProviderCount; ++i) {
         if (!g_ui.meter_card_open[i]) {
@@ -2496,6 +2514,7 @@ void sync_card_windows() {
             g_ui.meter_card_window_visible[i] = true;
             SDL_RaiseWindow(g_ui.meter_card_window[i]);
         }
+        reassert_window_z_order(g_ui.meter_card_window[i]);
     }
 }
 
