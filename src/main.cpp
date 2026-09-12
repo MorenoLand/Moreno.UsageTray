@@ -3352,7 +3352,26 @@ void toggle_model_callout(int index) {
     apply_layout();
 }
 
-void handle_right_click(float, float) {
+void copy_login_link(int index) {
+    try {
+        OAuthLoginSession session = oauth_prepare_login_provider(store_key(index));
+        if (!SDL_SetClipboardText(session.authorize_url.c_str())) {
+            diagnostics_log(std::string("oauth link copy failed provider=") + provider_key(index) + " error=" + SDL_GetError());
+            return;
+        }
+        diagnostics_log(std::string("oauth link copied provider=") + provider_key(index));
+    } catch (const std::exception& error) {
+        diagnostics_log(std::string("oauth link copy failed provider=") + provider_key(index) + " error=" + error.what());
+    }
+}
+
+void handle_right_click(float x, float y) {
+    if (g_ui.settings_open) {
+        for (int i = 0; i < kProviderCount; ++i) if (contains(g_ui.settings_action[i], x, y)) {
+            copy_login_link(i);
+            return;
+        }
+    }
     request_settings(!g_ui.settings_target);
     apply_layout();
 }
@@ -3387,7 +3406,7 @@ void handle_click(float x, float y) {
         apply_layout();
         return;
     }
-    if (g_ui.hover_ring >= 0 && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
+    if (g_ui.hover_ring >= 0 && g_ui.hover_ring < kProviderCount && contains(g_ui.ring_slots[g_ui.hover_ring], x, y) && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
         int i = g_ui.hover_ring;
         request_settings(false);
         toggle_model_callout(i);
@@ -3587,7 +3606,7 @@ void handle_mouse_down(float x, float y) {
         g_ui.click_armed = true;
         return;
     }
-    if (g_ui.hover_ring >= 0 && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
+    if (g_ui.hover_ring >= 0 && g_ui.hover_ring < kProviderCount && contains(g_ui.ring_slots[g_ui.hover_ring], x, y) && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
         if (g_ui.settings_open) {
             handle_click(x, y);
             g_ui.click_armed = true;

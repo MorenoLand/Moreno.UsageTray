@@ -76,11 +76,22 @@ static std::optional<std::filesystem::path> find_agy_binary() {
         }
     }
     const char* local_app_data = std::getenv("LOCALAPPDATA");
-    if (local_app_data) candidates.push_back(std::filesystem::path(local_app_data) / "agy" / "bin" / "agy.exe");
+    if (local_app_data) {
+        candidates.push_back(std::filesystem::path(local_app_data) / "agy" / "bin" / "agy.exe");
+        candidates.push_back(std::filesystem::path(local_app_data) / "Programs" / "Antigravity IDE" / "resources" / "app" / "out" / "main.js");
+    }
     const char* user_profile = std::getenv("USERPROFILE");
-    if (user_profile) candidates.push_back(std::filesystem::path(user_profile) / ".local" / "bin" / "agy.exe");
+    if (user_profile) {
+        candidates.push_back(std::filesystem::path(user_profile) / ".local" / "bin" / "agy.exe");
+        candidates.push_back(std::filesystem::path(user_profile) / "AppData" / "Local" / "Programs" / "Antigravity IDE" / "resources" / "app" / "out" / "main.js");
+    }
     const char* home = std::getenv("HOME");
     if (home) candidates.push_back(std::filesystem::path(home) / ".local" / "bin" / "agy");
+#if defined(__APPLE__)
+    candidates.push_back("/Applications/Antigravity IDE.app/Contents/Resources/app/out/main.js");
+#elif defined(__linux__)
+    candidates.push_back("/opt/Antigravity IDE/resources/app/out/main.js");
+#endif
     std::error_code error;
     for (const auto& candidate : candidates) if (std::filesystem::is_regular_file(candidate, error)) return candidate;
     return std::nullopt;
@@ -424,19 +435,35 @@ OAuthCredentials oauth_login_browser() {
     return oauth_login_browser_provider("openai");
 }
 
-OAuthCredentials oauth_login_browser_provider(const std::string& provider) {
+OAuthLoginSession oauth_prepare_login_provider(const std::string& provider) {
     std::string kind = oauth_provider_kind(provider);
     if (kind == "glm") {
         throw std::runtime_error("GLM OAuth is not configured yet");
     }
+    OAuthLoginSession session;
+    session.provider = provider;
     std::string verifier = base64url_encode(random_bytes(kind == "grok" ? 96 : 32));
     std::string challenge = base64url_encode(sha256_bytes(verifier));
     std::string state = kind == "anthropic" ? verifier : base64url_encode(random_bytes(16));
-    std::string url = kind == "anthropic"
-        ? create_anthropic_authorize_url(challenge, state)
-        : (kind == "grok" ? create_grok_authorize_url(challenge, state) : create_authorize_url(challenge, state));
+    session.verifier = verifier;
+    session.state = state;
+    if (kind == "gemini") {
+        GeminiOAuthConfig config = gemini_oauth_config();
+        session.client_id = config.client_id;
+        session.client_secret = config.client_secret;
+        session.authorize_url = create_gemini_authorize_url(config.client_id, challenge, state);
+    } else {
+        session.authorize_url = kind == "anthropic"
+            ? create_anthropic_authorize_url(challenge, state)
+            : (kind == "grok" ? create_grok_authorize_url(challenge, state) : create_authorize_url(challenge, state));
+    }
+    return session;
+}
 
-    auto code_future = std::async(std::launch::async, [kind, state] {
+OAuthCredentials oauth_login_browser_provider(const std::string& provider) {
+    std::string kind = oauth_provider_kind(provider);
+    OAuthLoginSession session = oauth_prepare_login_provider(provider);
+    auto code_future = std::async(std::launch::async, [kind, state = session.state] {
         if (kind == "anthropic") {
             return wait_for_oauth_code_on(53692, "/callback", state, "Claude");
         }
@@ -446,36 +473,20 @@ OAuthCredentials oauth_login_browser_provider(const std::string& provider) {
         return wait_for_oauth_code_on(1455, "/auth/callback", state, "ChatGPT");
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    open_browser(url);
+    open_browser(session.authorize_url);
     std::string code = code_future.get();
     OAuthCredentials credentials = kind == "anthropic"
-        ? exchange_anthropic_code(code, verifier)
-        : (kind == "grok" ? exchange_grok_code(code, verifier) : exchange_code(code, verifier));
+        ? exchange_anthropic_code(code, session.verifier)
+        : (kind == "grok" ? exchange_grok_code(code, session.verifier) : exchange_code(code, session.verifier));
     save_credentials_provider(provider, credentials);
     return credentials;
 }
 
 OAuthLoginSession oauth_begin_manual_login_provider(const std::string& provider) {
-    OAuthLoginSession session;
-    session.provider = provider;
     std::string kind = oauth_provider_kind(provider);
-    if (kind == "grok") {
-        session.verifier = base64url_encode(random_bytes(96));
-        session.state = base64url_encode(random_bytes(16));
-        session.client_id = kGrokClientId;
-        session.authorize_url = create_grok_authorize_url(base64url_encode(sha256_bytes(session.verifier)), session.state);
-        diagnostics_log("grok oauth browser start");
-        open_browser(session.authorize_url);
-        return session;
-    }
-    if (kind != "gemini") throw std::runtime_error("Manual OAuth is only configured for Gemini and Grok");
-    GeminiOAuthConfig config = gemini_oauth_config();
-    session.verifier = base64url_encode(random_bytes(32));
-    session.state = base64url_encode(random_bytes(16));
-    session.client_id = config.client_id;
-    session.client_secret = config.client_secret;
-    session.authorize_url = create_gemini_authorize_url(config.client_id, base64url_encode(sha256_bytes(session.verifier)), session.state);
-    diagnostics_log("gemini oauth browser start");
+    if (kind != "gemini" && kind != "grok") throw std::runtime_error("Manual OAuth is only configured for Gemini and Grok");
+    OAuthLoginSession session = oauth_prepare_login_provider(provider);
+    diagnostics_log(kind + " oauth browser start");
     open_browser(session.authorize_url);
     return session;
 }

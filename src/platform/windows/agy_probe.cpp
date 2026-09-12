@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -51,14 +50,12 @@ static std::vector<unsigned short> agy_listening_ports(const std::vector<DWORD>&
 }
 
 std::optional<std::string> fetch_agy_local_quota_summary() {
-    static std::mutex cache_mutex;
-    static unsigned short cached_http_port = 0;
     std::vector<DWORD> ids = agy_process_ids();
     if (ids.empty()) return std::nullopt;
     std::vector<unsigned short> ports = agy_listening_ports(ids);
     diagnostics_log("agy local probe processes=" + std::to_string(ids.size()) + " ports=" + std::to_string(ports.size()));
-    auto probe = [](unsigned short port, const char* scheme) -> std::optional<std::string> {
-        std::string url = std::string(scheme) + "://127.0.0.1:" + std::to_string(port) + "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
+    auto probe = [](unsigned short port) -> std::optional<std::string> {
+        std::string url = "http://127.0.0.1:" + std::to_string(port) + "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
         try {
             HttpResponse response = http_post_json(url, "{}", {
                 {"Connect-Protocol-Version", "1"},
@@ -71,26 +68,12 @@ std::optional<std::string> fetch_agy_local_quota_summary() {
         }
         return std::nullopt;
     };
-    unsigned short cached = 0;
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        cached = cached_http_port;
-    }
-    if (cached != 0) {
-        if (auto body = probe(cached, "http")) return body;
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        if (cached_http_port == cached) cached_http_port = 0;
-    }
-    for (unsigned short port : ports) {
-        if (auto body = probe(port, "http")) {
-            std::lock_guard<std::mutex> lock(cache_mutex);
-            cached_http_port = port;
+    if (!ports.empty()) {
+        unsigned short port = ports.front();
+        if (auto body = probe(port)) {
             diagnostics_log("agy local probe selected_http_port=" + std::to_string(port));
             return body;
         }
-    }
-    for (unsigned short port : ports) {
-        if (auto body = probe(port, "https")) return body;
     }
     return std::nullopt;
 }
