@@ -1227,11 +1227,27 @@ void toggle_panel_from_tray() {
     g_ui.pinned = pinned;
 }
 
+void polish_tool_window(SDL_Window* window) {
+#if defined(_WIN32)
+    if (!window) return;
+    HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+    if (!hwnd) return;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    ex |= WS_EX_TOOLWINDOW;
+    ex &= ~WS_EX_APPWINDOW;
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+#else
+    (void)window;
+#endif
+}
+
 void polish_native_window() {
 #if defined(_WIN32)
 #ifndef DWMWA_CAPTION_COLOR
 #define DWMWA_CAPTION_COLOR 35
 #endif
+    polish_tool_window(g_ui.window);
     HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(g_ui.window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
     if (!hwnd) return;
     LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -1313,11 +1329,15 @@ void tick_ui(float dt) {
     else g_ui.card_y_anim = approach(g_ui.card_y_anim, target_y, dt, 12.0f);
 }
 
+int ring_index_at(float x, float y) {
+    for (int i = 0; i < kProviderCount; ++i) if (contains(g_ui.ring_slots[i], x, y)) return i;
+    return -1;
+}
+
 void update_hover(float x, float y) {
-    g_ui.hover_ring = -1;
+    g_ui.hover_ring = ring_index_at(x, y);
     g_ui.gear_hovered = contains(g_ui.gear_button, x, y);
     g_ui.pin_hovered = contains(g_ui.pin_button, x, y);
-    for (int i = 0; i < kProviderCount; ++i) if (contains(g_ui.ring_slots[i], x, y)) g_ui.hover_ring = i;
 }
 
 bool global_point_in_window(SDL_Window* window, float x, float y) {
@@ -2332,6 +2352,7 @@ bool create_card_window(int index) {
     SDL_Window* window = SDL_CreateWindow("LLM Usage Tray Card", logical_width, logical_height,
         SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_TRANSPARENT | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) return false;
+    polish_tool_window(window);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, nullptr);
     if (!renderer) {
         SDL_DestroyWindow(window);
@@ -2364,6 +2385,7 @@ bool create_meter_card_window(int index) {
     SDL_Window* window = SDL_CreateWindow("LLM Usage Tray Card", logical_width, logical_height,
         SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_TRANSPARENT | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) return false;
+    polish_tool_window(window);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, nullptr);
     if (!renderer) {
         SDL_DestroyWindow(window);
@@ -2769,6 +2791,7 @@ void end_card_drag(int index) {
 
 void handle_card_mouse_down(int index, float x, float y) {
     if (index < 0 || index >= kProviderCount) return;
+    SDL_CaptureMouse(true);
     if (g_ui.meter_pinned[index]) {
         if (g_ui.meter_returning[index]) return;
         float gx = 0, gy = 0;
@@ -2801,11 +2824,13 @@ void handle_card_mouse_down(int index, float x, float y) {
 }
 
 void handle_card_mouse_up(int index) {
+    SDL_CaptureMouse(false);
     end_card_drag(index);
 }
 
 void handle_meter_card_mouse_down(int index, float x, float y) {
     if (index < 0 || index >= kProviderCount || !g_ui.meter_card_open[index]) return;
+    SDL_CaptureMouse(true);
     if (contains(g_ui.card_pin_button[index], x, y)) {
         toggle_model_pin(index);
         return;
@@ -2827,6 +2852,7 @@ void handle_meter_card_mouse_down(int index, float x, float y) {
 }
 
 void handle_meter_card_mouse_up(int index) {
+    SDL_CaptureMouse(false);
     if (index < 0 || index >= kProviderCount || g_ui.dragging_model != index || !g_ui.dragging_meter_card) return;
     g_ui.dragging_model = -1;
     g_ui.dragging_meter_card = false;
@@ -3406,8 +3432,9 @@ void handle_click(float x, float y) {
         apply_layout();
         return;
     }
-    if (g_ui.hover_ring >= 0 && g_ui.hover_ring < kProviderCount && contains(g_ui.ring_slots[g_ui.hover_ring], x, y) && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
-        int i = g_ui.hover_ring;
+    int ring = ring_index_at(x, y);
+    if (ring >= 0 && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
+        int i = ring;
         request_settings(false);
         toggle_model_callout(i);
         if (provider_has_auth(i)) refresh_usage_async_for(i, false);
@@ -3606,7 +3633,9 @@ void handle_mouse_down(float x, float y) {
         g_ui.click_armed = true;
         return;
     }
-    if (g_ui.hover_ring >= 0 && g_ui.hover_ring < kProviderCount && contains(g_ui.ring_slots[g_ui.hover_ring], x, y) && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
+    int ring = ring_index_at(x, y);
+    if (ring >= 0 && !g_ui.api_key_mode && !g_ui.oauth_code_mode) {
+        g_ui.hover_ring = ring;
         if (g_ui.settings_open) {
             handle_click(x, y);
             g_ui.click_armed = true;
@@ -3615,6 +3644,7 @@ void handle_mouse_down(float x, float y) {
         g_ui.pending_ring = g_ui.hover_ring;
         g_ui.press_x = x;
         g_ui.press_y = y;
+        SDL_CaptureMouse(true);
         return;
     }
     if (g_ui.gear_hovered || g_ui.pin_hovered || over_click_target(x, y)) {
@@ -3648,6 +3678,7 @@ void handle_mouse_down(float x, float y) {
     g_ui.drag_moved = false;
     g_ui.drag_offset_x = static_cast<int>(gx) - wx;
     g_ui.drag_offset_y = static_cast<int>(gy) - wy;
+    SDL_CaptureMouse(true);
 }
 
 void handle_mouse_motion() {
@@ -3659,7 +3690,37 @@ void handle_mouse_motion() {
     if (g_ui.pending_ring >= 0 || g_ui.reorder_slot >= 0) {
         float dx = lx - g_ui.press_x;
         float dy = ly - g_ui.press_y;
-        bool near_dock = lx >= g_ui.dock_ox - 12.0f && lx <= g_ui.dock_ox + static_cast<float>(kDockWidth) + 12.0f;
+        bool near_dock = lx >= g_ui.dock_rect.x - 12.0f && lx <= g_ui.dock_rect.x + g_ui.dock_rect.w + 12.0f && ly >= g_ui.dock_rect.y - 12.0f && ly <= g_ui.dock_rect.y + g_ui.dock_rect.h + 12.0f;
+        if (!near_dock && dx * dx + dy * dy > 576.0f) {
+            int index = g_ui.reorder_slot >= 0 ? g_ui.reorder_slot : g_ui.pending_ring;
+            g_ui.pending_ring = -1;
+            g_ui.reorder_slot = -1;
+            g_ui.reorder_anim[index] = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_app.mutex);
+                g_app.selected = index;
+            }
+            for (int j = 0; j < kProviderCount; ++j) if (j != index && model_is_snapped(j)) g_ui.model_open[j] = false;
+            float scale = std::max(0.01f, g_ui.panel_scale);
+            g_ui.model_open[index] = false;
+            g_ui.model_pinned[index] = false;
+            g_ui.model_detached[index] = false;
+            g_ui.meter_pinned[index] = true;
+            g_ui.meter_press_x = gx;
+            g_ui.meter_press_y = gy;
+            g_ui.grab_x = kMeterWindowWidth / 2;
+            g_ui.grab_y = kMeterWindowHeight / 2;
+            g_ui.meter_screen_x[index] = static_cast<int>(std::lround(gx - static_cast<float>(g_ui.grab_x) * scale));
+            g_ui.meter_screen_y[index] = static_cast<int>(std::lround(gy - static_cast<float>(g_ui.grab_y) * scale));
+            g_ui.drag_moved = true;
+            g_ui.dragging_meter_card = false;
+            sync_callout_open();
+            g_ui.dragging_model = index;
+            g_ui.drag_layout_ready = true;
+            if (provider_has_auth(index)) refresh_usage_async_for(index, false);
+            sync_card_windows();
+            return;
+        }
         if (g_ui.reorder_slot >= 0 || (g_ui.pending_ring >= 0 && near_dock && std::abs(dy) > 10.0f && std::abs(dy) >= std::abs(dx))) {
             int index = g_ui.reorder_slot >= 0 ? g_ui.reorder_slot : g_ui.pending_ring;
             g_ui.pending_ring = -1;
@@ -3671,31 +3732,6 @@ void handle_mouse_motion() {
                 save_layout();
             }
             return;
-        }
-        if (g_ui.pending_ring >= 0 && dx * dx + dy * dy > 576.0f && !near_dock) {
-            int index = g_ui.pending_ring;
-            g_ui.pending_ring = -1;
-            {
-                std::lock_guard<std::mutex> lock(g_app.mutex);
-                g_app.selected = index;
-            }
-            for (int j = 0; j < kProviderCount; ++j) {
-                if (j != index && model_is_snapped(j)) g_ui.model_open[j] = false;
-            }
-            float scale = std::max(0.01f, g_ui.panel_scale);
-            g_ui.model_open[index] = false;
-            g_ui.model_pinned[index] = false;
-            g_ui.model_detached[index] = false;
-            g_ui.meter_pinned[index] = true;
-            g_ui.grab_x = kMeterWindowWidth / 2;
-            g_ui.grab_y = kMeterWindowHeight / 2;
-            g_ui.meter_screen_x[index] = static_cast<int>(std::lround(gx - static_cast<float>(g_ui.grab_x) * scale));
-            g_ui.meter_screen_y[index] = static_cast<int>(std::lround(gy - static_cast<float>(g_ui.grab_y) * scale));
-            sync_callout_open();
-            g_ui.dragging_model = index;
-            g_ui.drag_layout_ready = true;
-            if (provider_has_auth(index)) refresh_usage_async_for(index, false);
-            sync_card_windows();
         }
         return;
     }
@@ -3741,6 +3777,7 @@ void handle_mouse_motion() {
 }
 
 void handle_mouse_up(float x, float y) {
+    SDL_CaptureMouse(false);
     if (g_ui.reorder_slot >= 0) {
         int index = g_ui.reorder_slot;
         g_ui.reorder_anim[index] = 1.0f;
