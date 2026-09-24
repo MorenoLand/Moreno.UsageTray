@@ -43,8 +43,14 @@ static constexpr const char* kCodexResponsesUrl = "https://chatgpt.com/backend-a
 static constexpr const char* kClaudeMessagesUrl = "https://api.anthropic.com/v1/messages";
 static constexpr const char* kGlmQuotaUrl = "https://api.z.ai/api/monitor/usage/quota/limit";
 static constexpr const char* kGlmChatUrl = "https://api.z.ai/api/coding/paas/v4/chat/completions";
-static constexpr const char* kGeminiQuotaUrl = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
-static constexpr const char* kGeminiQuotaSummaryUrl = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+static constexpr const char* kGeminiQuotaUrls[] = {
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+};
+static constexpr const char* kGeminiQuotaSummaryUrls[] = {
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+};
 static constexpr const char* kGrokBillingUrl = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 static constexpr const char* kGrokSettingsUrl = "https://cli-chat-proxy.grok.com/v1/settings";
 static constexpr const char* kGrokChatUrl = "https://cli-chat-proxy.grok.com/v1/chat/completions";
@@ -590,23 +596,43 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
             {"User-Agent", "antigravity/cli/1.1.24 windows/amd64"},
             {"Client-Metadata", "{\"ideType\":\"ANTIGRAVITY\",\"platform\":\"" + gemini_platform() + "\",\"pluginType\":\"GEMINI\"}"},
         };
-        HttpResponse summary = http_post_json(kGeminiQuotaSummaryUrl, body, headers);
-        diagnostics_log("gemini quota summary status=" + std::to_string(summary.status) + " body_length=" + std::to_string(summary.body.size()));
-        diagnostics_log_raw("gemini quota summary raw_body", summary.body);
-        if (summary.status >= 200 && summary.status < 300) {
-            try {
-                return parse_gemini_summary(summary.body);
-            } catch (const std::exception& error) {
-                diagnostics_log("gemini quota summary parse_error=" + std::string(error.what()));
+        std::optional<UsageInfo> best_info;
+        for (const char* url : kGeminiQuotaSummaryUrls) {
+            HttpResponse summary = http_post_json(url, body, headers);
+            diagnostics_log("gemini quota summary url=" + std::string(url) + " status=" + std::to_string(summary.status) + " body_length=" + std::to_string(summary.body.size()));
+            diagnostics_log_raw("gemini quota summary raw_body", summary.body);
+            if (summary.status >= 200 && summary.status < 300) {
+                try {
+                    UsageInfo info = parse_gemini_summary(summary.body);
+                    if (info.primary.used_percent > 0 || info.secondary.used_percent > 0) {
+                        return info;
+                    }
+                    if (!best_info) best_info = info;
+                } catch (const std::exception& error) {
+                    diagnostics_log("gemini quota summary parse_error=" + std::string(error.what()));
+                }
             }
         }
-        HttpResponse res = http_post_json(kGeminiQuotaUrl, body, headers);
-        diagnostics_log("gemini quota legacy status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()));
-        diagnostics_log_raw("gemini quota legacy raw_body", res.body);
-        if (res.status < 200 || res.status >= 300) {
-            throw std::runtime_error("Gemini quota request failed: HTTP " + std::to_string(res.status));
+        if (best_info) return *best_info;
+
+        for (const char* url : kGeminiQuotaUrls) {
+            HttpResponse res = http_post_json(url, body, headers);
+            diagnostics_log("gemini quota legacy url=" + std::string(url) + " status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()));
+            diagnostics_log_raw("gemini quota legacy raw_body", res.body);
+            if (res.status >= 200 && res.status < 300) {
+                try {
+                    UsageInfo info = parse_gemini_usage(res.body);
+                    if (info.primary.used_percent > 0 || info.secondary.used_percent > 0) {
+                        return info;
+                    }
+                    if (!best_info) best_info = info;
+                } catch (const std::exception& error) {
+                    diagnostics_log("gemini quota legacy parse_error=" + std::string(error.what()));
+                }
+            }
         }
-        return parse_gemini_usage(res.body);
+        if (best_info) return *best_info;
+        throw std::runtime_error("Gemini quota request failed");
     }
 
     if (kind == "anthropic") {
