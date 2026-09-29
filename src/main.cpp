@@ -67,7 +67,7 @@ constexpr int kDockFooter = 50;
 constexpr int kCalloutHeight = 168;
 constexpr int kCalloutSingleRowHeight = 112;
 constexpr int kSettingsRowHeight = 52;
-constexpr int kSettingsHeader = 48;
+constexpr int kSettingsHeader = 78;
 constexpr int kSettingsExtra = 288;
 constexpr int kSettingsFooter = 56;
 constexpr int kFormSheetHeight = 168;
@@ -147,12 +147,16 @@ struct UiState {
     int meter_card_window_height[kProviderCount]{};
     Rect card_pin_button[kProviderCount];
     SDL_Tray* tray = nullptr;
+    SDL_TrayEntry* tray_icon_style_entry = nullptr;
     SDL_Surface* icon = nullptr;
     int tray_main_model = -1;
     int tray_icon_model = -2;
     int tray_icon_percent = -2;
     bool tray_icon_logged = false;
     bool tray_icon_remaining = true;
+    bool tray_icon_light = true;
+    bool tray_icon_cached_light = false;
+    bool window_icon_cached = false;
     TTF_Font* font = nullptr;
     TTF_Font* font_bold = nullptr;
     TTF_Font* font_small = nullptr;
@@ -191,8 +195,10 @@ struct UiState {
     bool model_pinned[kProviderCount]{};
     bool meter_pinned[kProviderCount]{};
     bool meter_returning[kProviderCount]{};
+    bool meter_drop_hover[kProviderCount]{};
     bool meter_card_open[kProviderCount]{};
     float meter_anim[kProviderCount]{};
+    float dock_drop_anim[kProviderCount]{};
     int meter_screen_x[kProviderCount]{};
     int meter_screen_y[kProviderCount]{};
     int meter_card_screen_x[kProviderCount]{};
@@ -226,6 +232,7 @@ struct UiState {
     Rect settings_toggle[kProviderCount];
     Rect settings_action[kProviderCount];
     Rect settings_star[kProviderCount];
+    Rect settings_models_tab, settings_preferences_tab;
     Rect settings_add[kKindCount];
     Rect settings_remove[kProviderCount];
     Rect settings_add_kind[kKindCount];
@@ -239,6 +246,7 @@ struct UiState {
     Rect settings_time_prev, settings_time_next;
     Rect settings_window_prev, settings_window_next;
     Rect settings_update_toggle, settings_check_updates;
+    Rect settings_animation_toggle, settings_tray_icon_mode;
     Rect update_yes, update_later, update_ignore;
     bool confirm_open = false;
     int confirm_index = -1;
@@ -246,6 +254,7 @@ struct UiState {
     Rect api_input, api_ok, api_cancel;
     Rect oauth_code_input_box, oauth_code_ok, oauth_code_cancel;
     float used_anim[kProviderCount]{};
+    float ring_time = 0;
     float hover_anim[kProviderCount]{};
     float reorder_anim[kProviderCount]{};
     float gear_hot = 0;
@@ -255,6 +264,8 @@ struct UiState {
     float draw_opacity = 1.0f;
     float ui_scale = kDefaultUiScale;
     bool use_24_hour = false;
+    int settings_tab = 0;
+    bool animations_enabled = true;
     bool always_on_top = true;
     bool update_check_enabled = true;
     bool update_dialog_open = false;
@@ -682,8 +693,14 @@ bool any_meter_pinned() {
 
 int dock_height() {
     int n = enabled_count();
+    float drop_slots = 0.0f;
+    for (int i = 0; i < kProviderCount; ++i) {
+        if ((!g_ui.meter_pinned[i] && !g_ui.meter_returning[i]) || g_ui.dock_drop_anim[i] <= 0.001f) continue;
+        if (g_ui.meter_returning[i] || g_ui.slot_anim[i] > 0.02f) --n;
+        drop_slots += g_ui.dock_drop_anim[i];
+    }
     if (n < 1 && !any_meter_pinned()) n = 1;
-    return kDockPad + n * kRingSlot + kDockFooter;
+    return kDockPad + n * kRingSlot + static_cast<int>(std::lround(drop_slots * kRingSlot)) + kDockFooter;
 }
 
 int extra_slot_count() {
@@ -703,9 +720,12 @@ int hidden_kind_count() {
 }
 
 int settings_height() {
-    int rows = listed_kind_count() + extra_slot_count();
-    int add = hidden_kind_count() > 0 ? 44 : 0;
-    return kSettingsHeader + rows * kSettingsRowHeight + kSettingsExtra + add + kSettingsFooter;
+    if (g_ui.settings_tab == 0) {
+        int rows = listed_kind_count() + extra_slot_count();
+        int add = hidden_kind_count() > 0 ? 44 : 0;
+        return kSettingsHeader + rows * kSettingsRowHeight + add + kSettingsFooter + 8;
+    }
+    return kSettingsHeader + 334 + 16 + 42;
 }
 
 int sheet_height() {
@@ -763,6 +783,7 @@ bool over_click_target(float x, float y) {
         if (contains(g_ui.ring_slots[i], x, y) || contains(g_ui.model_pin_button[i], x, y)) return true;
     }
     if (g_ui.settings_open) {
+        if (contains(g_ui.settings_models_tab, x, y) || contains(g_ui.settings_preferences_tab, x, y) || contains(g_ui.settings_animation_toggle, x, y) || contains(g_ui.settings_tray_icon_mode, x, y)) return true;
         for (int i = 0; i < kProviderCount; ++i) {
             if (contains(g_ui.settings_toggle[i], x, y) || contains(g_ui.settings_action[i], x, y) || contains(g_ui.settings_star[i], x, y)) return true;
         }
@@ -1038,6 +1059,7 @@ int card_index_for_window(SDL_WindowID window_id);
 void card_event_logical(int index, SDL_Event event, float* x, float* y, SDL_Renderer* renderer = nullptr);
 void toggle_model_pin(int index);
 void sync_tray_icon();
+void save_layout();
 
 void apply_layout() {
     float scale = std::max(0.01f, g_ui.panel_scale);
@@ -1264,6 +1286,9 @@ void polish_native_window() {
 }
 
 void tick_ui(float dt) {
+    if (g_ui.animations_enabled) g_ui.ring_time += dt;
+    else g_ui.ring_time = 0;
+    if (g_ui.ring_time > 100000.0f) g_ui.ring_time = 0;
     double used[kProviderCount]{};
     bool logged[kProviderCount]{};
     bool shown[kProviderCount]{};
@@ -1273,22 +1298,24 @@ void tick_ui(float dt) {
             logged[i] = g_app.providers[i].logged_in;
             used[i] = logged[i] ? g_app.providers[i].primary_used : 0;
             int kind = g_app.slot_kind[i];
-        shown[i] = g_app.enabled[i] && kind >= 0 && (i >= kKindCount || g_app.listed[kind]) && (!g_ui.meter_pinned[i] || g_ui.meter_returning[i]);
+        shown[i] = g_app.enabled[i] && kind >= 0 && (i >= kKindCount || g_app.listed[kind]) && (!g_ui.meter_pinned[i] || g_ui.meter_returning[i] || g_ui.meter_drop_hover[i]);
         }
     }
     for (int i = 0; i < kProviderCount; ++i) {
-        g_ui.used_anim[i] = approach(g_ui.used_anim[i], static_cast<float>(used[i]), dt, 10.0f);
-        g_ui.hover_anim[i] = approach(g_ui.hover_anim[i], g_ui.hover_ring == i ? 1.0f : 0.0f, dt, 16.0f);
-        g_ui.slot_anim[i] = approach(g_ui.slot_anim[i], shown[i] ? 1.0f : 0.0f, dt, 14.0f);
-        g_ui.meter_anim[i] = approach(g_ui.meter_anim[i], g_ui.meter_pinned[i] && !g_ui.meter_returning[i] ? 1.0f : 0.0f, dt, 14.0f);
-        g_ui.reorder_anim[i] = approach(g_ui.reorder_anim[i], g_ui.reorder_slot == i ? 1.0f : 0.0f, dt, 18.0f);
+        g_ui.used_anim[i] = g_ui.animations_enabled ? approach(g_ui.used_anim[i], static_cast<float>(used[i]), dt, 10.0f) : static_cast<float>(used[i]);
+        g_ui.hover_anim[i] = g_ui.animations_enabled ? approach(g_ui.hover_anim[i], g_ui.hover_ring == i ? 1.0f : 0.0f, dt, 16.0f) : (g_ui.hover_ring == i ? 1.0f : 0.0f);
+        g_ui.slot_anim[i] = g_ui.animations_enabled ? approach(g_ui.slot_anim[i], shown[i] ? 1.0f : 0.0f, dt, 14.0f) : (shown[i] ? 1.0f : 0.0f);
+        bool drop_target = g_ui.meter_drop_hover[i] || g_ui.meter_returning[i];
+        g_ui.dock_drop_anim[i] = g_ui.animations_enabled ? approach(g_ui.dock_drop_anim[i], drop_target ? 1.0f : 0.0f, dt, 10.0f) : (drop_target ? 1.0f : 0.0f);
+        g_ui.meter_anim[i] = g_ui.animations_enabled ? approach(g_ui.meter_anim[i], g_ui.meter_pinned[i] && !g_ui.meter_returning[i] ? 1.0f : 0.0f, dt, 14.0f) : (g_ui.meter_pinned[i] && !g_ui.meter_returning[i] ? 1.0f : 0.0f);
+        g_ui.reorder_anim[i] = g_ui.animations_enabled ? approach(g_ui.reorder_anim[i], g_ui.reorder_slot == i ? 1.0f : 0.0f, dt, 18.0f) : (g_ui.reorder_slot == i ? 1.0f : 0.0f);
     }
-    g_ui.gear_hot = approach(g_ui.gear_hot, g_ui.gear_hovered ? 1.0f : 0.0f, dt, 16.0f);
-    g_ui.pin_hot = approach(g_ui.pin_hot, (g_ui.pin_hovered || g_ui.pinned) ? 1.0f : 0.0f, dt, 16.0f);
+    g_ui.gear_hot = g_ui.animations_enabled ? approach(g_ui.gear_hot, g_ui.gear_hovered ? 1.0f : 0.0f, dt, 16.0f) : (g_ui.gear_hovered ? 1.0f : 0.0f);
+    g_ui.pin_hot = g_ui.animations_enabled ? approach(g_ui.pin_hot, (g_ui.pin_hovered || g_ui.pinned) ? 1.0f : 0.0f, dt, 16.0f) : ((g_ui.pin_hovered || g_ui.pinned) ? 1.0f : 0.0f);
     bool relayout = false;
     for (int i = 0; i < kProviderCount; ++i) {
         float prev = g_ui.model_anim[i];
-        g_ui.model_anim[i] = approach(g_ui.model_anim[i], g_ui.model_open[i] ? 1.0f : 0.0f, dt, 11.0f);
+        g_ui.model_anim[i] = g_ui.animations_enabled ? approach(g_ui.model_anim[i], g_ui.model_open[i] ? 1.0f : 0.0f, dt, 11.0f) : (g_ui.model_open[i] ? 1.0f : 0.0f);
         if (!g_ui.model_open[i] && g_ui.model_anim[i] < 0.02f) {
             g_ui.model_detached[i] = false;
             if (prev >= 0.02f) relayout = true;
@@ -1296,6 +1323,8 @@ void tick_ui(float dt) {
         if (g_ui.meter_pinned[i] && g_ui.meter_returning[i] && g_ui.meter_anim[i] < 0.02f) {
             g_ui.meter_pinned[i] = false;
             g_ui.meter_returning[i] = false;
+            g_ui.meter_drop_hover[i] = false;
+            g_ui.dock_drop_anim[i] = 0.0f;
             g_ui.meter_screen_x[i] = 0;
             g_ui.meter_screen_y[i] = 0;
             relayout = true;
@@ -1319,14 +1348,14 @@ void tick_ui(float dt) {
     }
     bool left = left_sheet_open();
     for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_anim[i] > 0.02f) left = true;
-    g_ui.left_anim = approach(g_ui.left_anim, left ? 1.0f : 0.0f, dt, 13.0f);
+    g_ui.left_anim = g_ui.animations_enabled ? approach(g_ui.left_anim, left ? 1.0f : 0.0f, dt, 13.0f) : (left ? 1.0f : 0.0f);
     bool sheet_target = g_ui.settings_target || g_ui.api_key_mode || g_ui.oauth_code_mode || g_ui.confirm_open || g_ui.update_dialog_open;
-    g_ui.settings_anim = approach(g_ui.settings_anim, sheet_target ? 1.0f : 0.0f, dt, 13.0f);
+    g_ui.settings_anim = g_ui.animations_enabled ? approach(g_ui.settings_anim, sheet_target ? 1.0f : 0.0f, dt, 13.0f) : (sheet_target ? 1.0f : 0.0f);
     if (!sheet_target && g_ui.settings_open && g_ui.settings_anim < 0.02f) g_ui.settings_open = false;
     float target_y = 0, target_h = 0;
     left_card_geom(&target_y, &target_h);
     if (g_ui.left_anim < 0.05f) g_ui.card_y_anim = target_y;
-    else g_ui.card_y_anim = approach(g_ui.card_y_anim, target_y, dt, 12.0f);
+    else g_ui.card_y_anim = g_ui.animations_enabled ? approach(g_ui.card_y_anim, target_y, dt, 12.0f) : target_y;
 }
 
 int ring_index_at(float x, float y) {
@@ -1856,7 +1885,47 @@ void cycle_button(Rect r, const std::string& label, Rect* previous, Rect* next) 
 void usage_track(float x, float y, float width, double used, bool weekly) {
     fill_round({x, y, width, 6}, 3, 44, 44, 48);
     float fw = static_cast<float>(display_percent(used) / 100.0 * width);
-    if (fw > 0.5f) fill_round({x, y, std::max(6.0f, fw), 6}, 3, weekly ? 48 : 240, weekly ? 209 : 196, weekly ? 88 : 64);
+    if (fw <= 0.5f) return;
+    float fill_width = std::max(6.0f, fw);
+    Uint8 br = weekly ? 48 : 240;
+    Uint8 bg = weekly ? 209 : 196;
+    Uint8 bb = weekly ? 88 : 64;
+    fill_round({x, y, fill_width, 6}, 3, br, bg, bb);
+    if (!g_ui.animations_enabled || fill_width < 12.0f) return;
+    float speed = weekly ? 48.0f : 92.0f;
+    float sheen_width = weekly ? std::min(28.0f, std::max(12.0f, fill_width * 0.22f)) : std::min(24.0f, std::max(10.0f, fill_width * 0.14f));
+    float phase = std::fmod(g_ui.ring_time * speed + y * 1.7f, fill_width + sheen_width) - sheen_width;
+    float sheen_center = x + phase + sheen_width * 0.5f;
+    auto band = [&](float width, Uint8 alpha) {
+        float left = std::max(x, sheen_center - width * 0.5f);
+        float right = std::min(x + fill_width, sheen_center + width * 0.5f);
+        if (right <= left) return;
+        float pulse = 0.5f + 0.5f * std::sin(g_ui.ring_time * (weekly ? 1.8f : 3.6f) + y * 0.03f);
+        Uint8 hr = weekly ? static_cast<Uint8>(72.0f + 60.0f * pulse) : static_cast<Uint8>(236.0f + 19.0f * pulse);
+        Uint8 hg = weekly ? static_cast<Uint8>(218.0f + 37.0f * pulse) : static_cast<Uint8>(150.0f + 70.0f * pulse);
+        Uint8 hb = weekly ? static_cast<Uint8>(150.0f + 65.0f * pulse) : static_cast<Uint8>(218.0f + 37.0f * pulse);
+        fill({left, y, right - left, 6}, hr, hg, hb, alpha);
+    };
+    if (weekly) {
+        float pulse = 0.5f + 0.5f * std::sin(g_ui.ring_time * 1.8f + y * 0.02f);
+        band(sheen_width, static_cast<Uint8>(62.0f + 20.0f * pulse));
+        band(sheen_width * 0.58f, static_cast<Uint8>(116.0f + 28.0f * pulse));
+        band(sheen_width * 0.24f, static_cast<Uint8>(208.0f + 24.0f * pulse));
+    } else {
+        band(sheen_width, 72);
+        band(sheen_width * 0.58f, 136);
+        band(sheen_width * 0.24f, 224);
+        float spark_phase = std::fmod(g_ui.ring_time * 145.0f + y * 2.3f, fill_width + 10.0f) - 10.0f;
+        auto spark = [&](float offset, float size, Uint8 alpha) {
+            float center = x + spark_phase + offset;
+            float left = std::max(x, center - size * 0.5f);
+            float right = std::min(x + fill_width, center + size * 0.5f);
+            if (right > left) fill_round({left, y + 1, right - left, 4}, 2, 232, 218, 255, alpha);
+        };
+        spark(0, 3.0f, 228);
+        spark(-6, 2.0f, 146);
+        spark(7, 1.6f, 112);
+    }
 }
 
 SDL_FPoint rotate_point(float x, float y, float cx, float cy, float radians) {
@@ -1927,7 +1996,7 @@ void stroke_arc(float cx, float cy, float radius, float thickness, float t0, flo
     }
 }
 
-void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent, float opacity = 1.0f, SDL_Color track = color(52, 52, 56), float thickness = 4.5f) {
+void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent, float opacity = 1.0f, SDL_Color track = color(52, 52, 56), float thickness = 4.5f, float phase = 0.0f, float pulse = 1.0f) {
     const int scale = 3;
     int size = static_cast<int>(std::ceil((radius + thickness + 2.0f) * 2.0f * scale));
     SDL_Surface* surface = SDL_CreateSurface(size, size, SDL_PIXELFORMAT_RGBA32);
@@ -1950,7 +2019,16 @@ void draw_ring(float cx, float cy, float radius, double used, SDL_Color accent, 
             if (ang < 0) ang += 6.2831853f;
             bool on_progress = sweep > 0.02f && ang <= sweep;
             SDL_Color c = on_progress ? accent : track;
-            float a = cover * std::clamp(opacity, 0.0f, 1.0f);
+            if (on_progress) {
+                float delta = std::abs(std::atan2(std::sin(ang - phase), std::cos(ang - phase)));
+                float sheen = std::clamp(1.0f - delta / 0.68f, 0.0f, 1.0f) * 0.72f;
+                float luminance = 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+                SDL_Color sheen_color = luminance > 150.0f ? color(28, 28, 34) : color(255, 255, 255);
+                c.r = static_cast<Uint8>(c.r + (sheen_color.r - c.r) * sheen);
+                c.g = static_cast<Uint8>(c.g + (sheen_color.g - c.g) * sheen);
+                c.b = static_cast<Uint8>(c.b + (sheen_color.b - c.b) * sheen);
+            }
+            float a = cover * std::clamp(opacity * pulse, 0.0f, 1.0f);
             pixels[py * stride + px] = SDL_MapSurfaceRGBA(surface,
                 static_cast<Uint8>(c.r * a + 0.5f),
                 static_cast<Uint8>(c.g * a + 0.5f),
@@ -2095,6 +2173,8 @@ void draw_panel() {
     g_ui.dock_rect = {dx, dy, static_cast<float>(kDockWidth), dock_h};
     g_ui.callout_pin_button = {};
     g_ui.settings_fill_toggle = {};
+    g_ui.settings_models_tab = {};
+    g_ui.settings_preferences_tab = {};
     g_ui.settings_refresh_interval = {};
     g_ui.settings_scale = {};
     g_ui.settings_time_format = {};
@@ -2109,6 +2189,8 @@ void draw_panel() {
     g_ui.settings_window_next = {};
     g_ui.settings_update_toggle = {};
     g_ui.settings_check_updates = {};
+    g_ui.settings_animation_toggle = {};
+    g_ui.settings_tray_icon_mode = {};
     g_ui.update_yes = {};
     g_ui.update_later = {};
     g_ui.update_ignore = {};
@@ -2135,7 +2217,10 @@ void draw_panel() {
         }
         double used = display_percent(g_ui.used_anim[i]);
         float materialize = std::clamp(g_ui.slot_anim[i], 0.0f, 1.0f);
-        draw_ring(cx, cy, 23.0f * pop * (0.68f + 0.32f * materialize), used, accent, materialize);
+        float pulse = g_ui.animations_enabled ? 0.90f + 0.10f * (0.5f + 0.5f * std::sin(g_ui.ring_time * 2.6f + static_cast<float>(i) * 0.8f)) : 1.0f;
+        float phase = g_ui.animations_enabled ? std::fmod(g_ui.ring_time * 1.8f + static_cast<float>(i) * 1.7f, 6.2831853f) : 0.0f;
+        float thickness = g_ui.animations_enabled ? 4.35f + 0.8f * (0.5f + 0.5f * std::sin(g_ui.ring_time * 2.2f + static_cast<float>(i))) : 4.75f;
+        draw_ring(cx, cy, 23.0f * pop * (0.68f + 0.32f * materialize), used, accent, materialize, color(52, 52, 56), thickness, phase, pulse);
         draw_provider_glyph(cx, cy, i, accent, static_cast<Uint8>(materialize * 255.0f));
         std::string pct = states[i].logged_in ? (std::to_string(static_cast<int>(std::round(used))) + "%") : "--";
         auto [tw, th] = measure_text(pct, false, true);
@@ -2214,6 +2299,10 @@ void draw_panel() {
                 std::string version = "v" + std::string(LLM_USAGE_TRAY_VERSION);
                 auto version_size = measure_text(version, false, true);
                 text(card_x + static_cast<float>(kCalloutWidth) - 18.0f - version_size.first, card_y + 20, version, 104, 104, 110, false, true);
+                g_ui.settings_models_tab = {card_x + 18, card_y + 42, 116, 28};
+                g_ui.settings_preferences_tab = {card_x + 142, card_y + 42, 116, 28};
+                button_styled(g_ui.settings_models_tab, "Models", true, g_ui.settings_tab == 0 ? color(245, 245, 247) : color(142, 142, 147), true);
+                button_styled(g_ui.settings_preferences_tab, "Settings", true, g_ui.settings_tab == 1 ? color(245, 245, 247) : color(142, 142, 147), true);
                 for (int i = 0; i < kKindCount; ++i) { g_ui.settings_add[i] = {}; g_ui.settings_add_kind[i] = {}; }
                 for (int i = 0; i < kProviderCount; ++i) g_ui.settings_remove[i] = {};
                 int row_i = 0;
@@ -2240,9 +2329,12 @@ void draw_panel() {
                     button_styled(g_ui.settings_remove[slot], "x", true, color(240, 104, 104), false);
                     ++row_i;
                 };
-                for (int i = 0; i < kKindCount; ++i) if (g_app.listed[i]) draw_settings_row(i, true);
-                for (int i = kKindCount; i < kMaxSlots; ++i) if (kind_of(i) >= 0) draw_settings_row(i, false);
+                if (g_ui.settings_tab == 0) {
+                    for (int i = 0; i < kKindCount; ++i) if (g_app.listed[i]) draw_settings_row(i, true);
+                    for (int i = kKindCount; i < kMaxSlots; ++i) if (kind_of(i) >= 0) draw_settings_row(i, false);
+                }
                 float fill_y = card_y + static_cast<float>(kSettingsHeader + row_i * kSettingsRowHeight);
+                if (g_ui.settings_tab == 1) {
                 text(card_x + 18, fill_y + 8, g_ui.show_remaining ? "Show remaining" : "Show used", 245, 245, 247, true, true);
                 g_ui.settings_fill_toggle = {card_x + 210, fill_y + 12, 36, 22};
                 aa_round_rect(g_ui.settings_fill_toggle, 11, g_ui.show_remaining ? color(48, 209, 88) : color(58, 58, 62), g_ui.show_remaining ? color(48, 209, 88) : color(58, 58, 62));
@@ -2270,7 +2362,17 @@ void draw_panel() {
                 fill_round({g_ui.settings_update_toggle.x + (g_ui.update_check_enabled ? 18.0f : 4.0f), update_y + 15, 16, 16}, 8, 245, 245, 247);
                 g_ui.settings_check_updates = {card_x + 210, update_y + 4, 100, 30};
                 button(g_ui.settings_check_updates, "Check now", true);
-                float add_y = fill_y + 260;
+                float animation_y = fill_y + 260;
+                text(card_x + 18, animation_y + 8, "Animations", 245, 245, 247, true, true);
+                g_ui.settings_animation_toggle = {card_x + 210, animation_y + 12, 36, 22};
+                aa_round_rect(g_ui.settings_animation_toggle, 11, g_ui.animations_enabled ? color(48, 209, 88) : color(58, 58, 62), g_ui.animations_enabled ? color(48, 209, 88) : color(58, 58, 62));
+                fill_round({g_ui.settings_animation_toggle.x + (g_ui.animations_enabled ? 18.0f : 4.0f), animation_y + 15, 16, 16}, 8, 245, 245, 247);
+                float tray_y = fill_y + 304;
+                text(card_x + 18, tray_y + 8, "Tray icon", 245, 245, 247, true, true);
+                g_ui.settings_tray_icon_mode = {card_x + 184, tray_y + 4, 124, 30};
+                button(g_ui.settings_tray_icon_mode, g_ui.tray_icon_light ? "Light" : "Dark", true);
+                } else {
+                float add_y = fill_y + 8;
                 int hidden_n = 0;
                 for (int k = 0; k < kKindCount; ++k) {
                     if (g_app.listed[k]) continue;
@@ -2279,6 +2381,7 @@ void draw_panel() {
                     aa_round_rect(g_ui.settings_add_kind[k], 8, color(36, 36, 38), color(58, 58, 62));
                     draw_provider_glyph(g_ui.settings_add_kind[k].x + 16, g_ui.settings_add_kind[k].y + 16, k, provider_accent(k));
                     ++hidden_n;
+                }
                 }
                 g_ui.settings_refresh = {card_x + 18, card_y + card_h - 42, 150, 28};
                 g_ui.settings_quit = {card_x + 178, card_y + card_h - 42, 140, 28};
@@ -2458,7 +2561,7 @@ void sync_card_windows() {
     bool wanted = !left_sheet_open();
     reassert_window_z_order(g_ui.window);
     for (int i = 0; i < kProviderCount; ++i) {
-        bool show = g_ui.meter_pinned[i] || (wanted && g_ui.model_open[i] && (g_ui.visible || g_ui.model_pinned[i] || g_ui.model_detached[i]));
+        bool show = !g_ui.meter_returning[i] && (g_ui.meter_pinned[i] || (wanted && g_ui.model_open[i] && (g_ui.visible || g_ui.model_pinned[i] || g_ui.model_detached[i])));
         if (!show) {
             if (g_ui.card_window_visible[i] && g_ui.card_window[i]) SDL_HideWindow(g_ui.card_window[i]);
             g_ui.card_window_visible[i] = false;
@@ -2556,7 +2659,10 @@ void draw_meter_content(int index, const ProviderState& state) {
         SDL_SetTextureColorMod(glyph, 255, 255, 255);
         SDL_SetTextureAlphaMod(glyph, 255);
     }
-    draw_ring(cx, cy, 23.0f, used, provider_accent(index), opacity);
+    float pulse = g_ui.animations_enabled ? 0.90f + 0.10f * (0.5f + 0.5f * std::sin(g_ui.ring_time * 2.6f + static_cast<float>(index) * 0.8f)) : 1.0f;
+    float phase = g_ui.animations_enabled ? std::fmod(g_ui.ring_time * 1.8f + static_cast<float>(index) * 1.7f, 6.2831853f) : 0.0f;
+    float thickness = g_ui.animations_enabled ? 4.35f + 0.8f * (0.5f + 0.5f * std::sin(g_ui.ring_time * 2.2f + static_cast<float>(index))) : 4.75f;
+    draw_ring(cx, cy, 23.0f, used, provider_accent(index), opacity, color(52, 52, 56), thickness, phase, pulse);
     draw_provider_glyph(cx, cy, index, provider_accent(index), alpha);
     std::string pct = state.logged_in ? (std::to_string(static_cast<int>(std::round(used))) + "%") : "--";
     auto [tw, th] = measure_text(pct, false, true);
@@ -2681,12 +2787,30 @@ bool global_point_in_dock(float x, float y) {
     return contains(g_ui.dock_rect, lx, ly);
 }
 
+bool global_point_near_dock(float x, float y) {
+    if (!g_ui.visible || !g_ui.window) return false;
+    int wx = 0, wy = 0;
+    SDL_GetWindowPosition(g_ui.window, &wx, &wy);
+    float lx = 0, ly = 0;
+    window_to_logical(x - static_cast<float>(wx), y - static_cast<float>(wy), &lx, &ly);
+    float nearest_x = std::clamp(lx, g_ui.dock_rect.x, g_ui.dock_rect.x + g_ui.dock_rect.w);
+    float nearest_y = std::clamp(ly, g_ui.dock_rect.y, g_ui.dock_rect.y + g_ui.dock_rect.h);
+    float dx = lx - nearest_x;
+    float dy = ly - nearest_y;
+    return dx * dx + dy * dy <= 42.0f * 42.0f;
+}
+
 void begin_meter_return(int index) {
     if (index < 0 || index >= kProviderCount || !g_ui.meter_pinned[index] || g_ui.meter_returning[index]) return;
     g_ui.meter_returning[index] = true;
+    g_ui.meter_drop_hover[index] = false;
     g_ui.meter_card_open[index] = false;
     g_ui.model_open[index] = false;
     g_ui.model_detached[index] = false;
+    if (g_ui.card_window[index] && g_ui.card_window_visible[index]) {
+        SDL_HideWindow(g_ui.card_window[index]);
+        g_ui.card_window_visible[index] = false;
+    }
     if (g_ui.dragging_model == index) {
         g_ui.dragging_model = -1;
         g_ui.dragging_meter_card = false;
@@ -2753,7 +2877,8 @@ void end_meter_drag(int index) {
     if (index < 0 || index >= kProviderCount || g_ui.dragging_model != index) return;
     float gx = 0, gy = 0;
     SDL_GetGlobalMouseState(&gx, &gy);
-    bool to_dock = global_point_in_dock(gx, gy);
+    bool to_dock = global_point_near_dock(gx, gy);
+    if (!to_dock) g_ui.meter_drop_hover[index] = false;
     bool click = !g_ui.drag_moved;
     if (to_dock) begin_meter_return(index);
     else if (click) {
@@ -2800,6 +2925,7 @@ void handle_card_mouse_down(int index, float x, float y) {
         g_ui.meter_press_x = gx;
         g_ui.meter_press_y = gy;
         g_ui.drag_moved = false;
+        g_ui.meter_drop_hover[index] = false;
         g_ui.grab_x = static_cast<int>(std::round(x));
         g_ui.grab_y = static_cast<int>(std::round(y));
         g_ui.meter_screen_x[index] = static_cast<int>(std::lround(gx - static_cast<float>(g_ui.grab_x) * scale));
@@ -2878,6 +3004,12 @@ void on_tray_refresh(void*, SDL_TrayEntry*) { g_refresh_requested = true; }
 void on_tray_warm(void*, SDL_TrayEntry*) { g_warm_requested = true; }
 void on_tray_recall(void*, SDL_TrayEntry*) { recall_meters(); }
 void on_tray_quit(void*, SDL_TrayEntry*) { g_quit = true; }
+void on_tray_icon_style(void*, SDL_TrayEntry* entry) {
+    g_ui.tray_icon_light = !g_ui.tray_icon_light;
+    if (entry) SDL_SetTrayEntryChecked(entry, g_ui.tray_icon_light);
+    save_layout();
+    sync_tray_icon();
+}
 
 bool on_tray_left_click(void*, SDL_Tray*) {
     g_tray_toggle_requested = true;
@@ -2997,6 +3129,44 @@ void draw_tray_meter_surface(SDL_Surface* surface, int provider_index, int progr
     }
 }
 
+void draw_app_mark_surface(SDL_Surface* surface, bool light, int provider_index = -1, int progress = -1) {
+    int size = surface->w;
+    SDL_Color background = light ? color(247, 247, 248) : color(18, 18, 20);
+    SDL_Color primary = light ? color(28, 28, 32) : color(245, 245, 247);
+    SDL_Color secondary = light ? color(140, 140, 146) : color(205, 205, 210);
+    fill_surface_round(surface, size, size, std::max(3, size / 5), SDL_MapSurfaceRGBA(surface, background.r, background.g, background.b, 255));
+    auto* pixels = static_cast<Uint32*>(surface->pixels);
+    int stride = surface->pitch / static_cast<int>(sizeof(Uint32));
+    float center = static_cast<float>(size) * 0.5f;
+    auto ring = [&](float radius, float thickness, SDL_Color c, float sweep = -1.0f, SDL_Color track = color(0, 0, 0)) {
+        for (int py = 0; py < size; ++py) for (int px = 0; px < size; ++px) {
+            float dx = static_cast<float>(px) + 0.5f - center;
+            float dy = static_cast<float>(py) + 0.5f - center;
+            float distance = std::sqrt(dx * dx + dy * dy);
+            float coverage = std::clamp(thickness * 0.5f + 0.45f - std::abs(distance - radius), 0.0f, 1.0f);
+            if (coverage <= 0.01f) continue;
+            float angle = std::atan2(dx, -dy);
+            if (angle < 0) angle += 6.2831853f;
+            if (angle < 0.20f || angle > 6.2831853f - 0.20f) continue;
+            SDL_Color draw = c;
+            if (sweep >= 0.0f && angle > sweep) draw = track;
+            float inverse = 1.0f - coverage;
+            SDL_Color blended{static_cast<Uint8>(draw.r * coverage + background.r * inverse), static_cast<Uint8>(draw.g * coverage + background.g * inverse), static_cast<Uint8>(draw.b * coverage + background.b * inverse), 255};
+            pixels[py * stride + px] = SDL_MapSurfaceRGBA(surface, blended.r, blended.g, blended.b, 255);
+        }
+    };
+    float stroke = std::max(1.25f, static_cast<float>(size) * 0.10f);
+    if (provider_index >= 0) {
+        SDL_Color active = provider_accent(provider_index);
+        if (light && active.r > 210 && active.g > 210 && active.b > 210) active = primary;
+        SDL_Color track = light ? color(165, 165, 171) : color(58, 58, 64);
+        float sweep = progress >= 0 ? static_cast<float>(std::clamp(progress, 0, 100) / 100.0 * 6.2831853) : 0.0f;
+        ring(size * 0.39f, stroke, active, sweep, track);
+    } else ring(size * 0.39f, stroke, primary);
+    ring(size * 0.27f, stroke * 0.9f, secondary);
+    ring(size * 0.15f, stroke * 0.9f, primary);
+}
+
 int tray_icon_size() {
 #if defined(_WIN32)
     return std::max(kTrayIconBaseSize, GetSystemMetrics(SM_CXSMICON));
@@ -3005,31 +3175,35 @@ int tray_icon_size() {
 #endif
 }
 
+int tray_icon_render_size() { return std::max(32, tray_icon_size() * 4); }
+
+void sync_window_app_icon() {
+    if (!g_ui.window || (g_ui.window_icon_cached && g_ui.tray_icon_cached_light == g_ui.tray_icon_light)) return;
+    int size = tray_icon_render_size();
+    SDL_Surface* icon = SDL_CreateSurface(size, size, SDL_PIXELFORMAT_RGBA32);
+    if (!icon) return;
+    SDL_ClearSurface(icon, 0, 0, 0, 0);
+    draw_app_mark_surface(icon, g_ui.tray_icon_light);
+    SDL_SetWindowIcon(g_ui.window, icon);
+    SDL_DestroySurface(icon);
+    g_ui.window_icon_cached = true;
+}
+
 SDL_Surface* make_icon_surface(int size, int provider_index = -1, int progress = -1) {
     SDL_Surface* icon = SDL_CreateSurface(size, size, SDL_PIXELFORMAT_RGBA32);
     if (!icon) return nullptr;
     SDL_ClearSurface(icon, 0, 0, 0, 0);
     if (provider_index >= 0) {
-        draw_tray_meter_surface(icon, provider_index, progress);
+        draw_app_mark_surface(icon, g_ui.tray_icon_light, provider_index, progress);
     } else {
-        Uint32 bg = SDL_MapSurfaceRGBA(icon, 23, 26, 28, 255);
-        Uint32 green = SDL_MapSurfaceRGBA(icon, 68, 188, 126, 255);
-        Uint32 blue = SDL_MapSurfaceRGBA(icon, 82, 145, 224, 255);
-        fill_surface_round(icon, size, size, std::max(4, size / 5), bg);
-        int margin = std::max(5, size / 5);
-        int bar_h = std::max(3, size / 8);
-        int bar_w = size - margin * 2;
-        SDL_Rect bar1{margin, size / 3 - bar_h / 2, bar_w, bar_h};
-        SDL_Rect bar2{margin, size * 2 / 3 - bar_h / 2, bar_w * 3 / 4, bar_h};
-        fill_surface_rect(icon, bar1, green);
-        fill_surface_rect(icon, bar2, blue);
+        draw_app_mark_surface(icon, g_ui.tray_icon_light);
     }
     return icon;
 }
 
 void create_tray() {
-    g_ui.icon = make_icon_surface(tray_icon_size());
-    if (g_ui.icon) SDL_SetWindowIcon(g_ui.window, g_ui.icon);
+    g_ui.icon = make_icon_surface(tray_icon_render_size());
+    sync_window_app_icon();
 #ifdef SDL_PROP_TRAY_CREATE_LEFTCLICK_CALLBACK_POINTER
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetPointerProperty(props, SDL_PROP_TRAY_CREATE_ICON_POINTER, g_ui.icon);
@@ -3046,6 +3220,11 @@ void create_tray() {
         if (show) SDL_SetTrayEntryCallback(show, on_tray_show, nullptr);
         SDL_TrayEntry* refresh = menu ? SDL_InsertTrayEntryAt(menu, -1, "Refresh", SDL_TRAYENTRY_BUTTON) : nullptr;
         if (refresh) SDL_SetTrayEntryCallback(refresh, on_tray_refresh, nullptr);
+        SDL_TrayEntry* style = menu ? SDL_InsertTrayEntryAt(menu, -1, "Light tray icon", SDL_TRAYENTRY_CHECKBOX | (g_ui.tray_icon_light ? SDL_TRAYENTRY_CHECKED : 0)) : nullptr;
+        if (style) {
+            g_ui.tray_icon_style_entry = style;
+            SDL_SetTrayEntryCallback(style, on_tray_icon_style, nullptr);
+        }
         SDL_TrayEntry* recall = menu ? SDL_InsertTrayEntryAt(menu, -1, "Recall meters", SDL_TRAYENTRY_BUTTON) : nullptr;
         if (recall) SDL_SetTrayEntryCallback(recall, on_tray_recall, nullptr);
         SDL_TrayEntry* quit = menu ? SDL_InsertTrayEntryAt(menu, -1, "Quit", SDL_TRAYENTRY_BUTTON) : nullptr;
@@ -3067,13 +3246,13 @@ void sync_tray_icon() {
         logged = state.logged_in;
         if (logged) percent = static_cast<int>(std::round(display_percent(state.primary_used)));
     }
-    if (model == g_ui.tray_icon_model && percent == g_ui.tray_icon_percent && logged == g_ui.tray_icon_logged && g_ui.tray_icon_remaining == g_ui.show_remaining) return;
-    SDL_Surface* next = make_icon_surface(tray_icon_size(), model, percent);
+    if (model == g_ui.tray_icon_model && percent == g_ui.tray_icon_percent && logged == g_ui.tray_icon_logged && g_ui.tray_icon_remaining == g_ui.show_remaining && g_ui.tray_icon_cached_light == g_ui.tray_icon_light) return;
+    SDL_Surface* next = make_icon_surface(tray_icon_render_size(), model, percent);
     if (!next) return;
     SDL_Surface* previous = g_ui.icon;
     g_ui.icon = next;
     if (g_ui.tray) SDL_SetTrayIcon(g_ui.tray, next);
-    if (g_ui.window) SDL_SetWindowIcon(g_ui.window, next);
+    sync_window_app_icon();
     if (g_ui.tray) {
         std::string tooltip = "LLM Usage Tray";
         if (model >= 0) tooltip = std::string(provider_label(model)) + (percent >= 0 ? " - " + std::to_string(percent) + (g_ui.show_remaining ? "% remaining" : "% used") : " - no usage yet");
@@ -3084,6 +3263,7 @@ void sync_tray_icon() {
     g_ui.tray_icon_percent = percent;
     g_ui.tray_icon_logged = logged;
     g_ui.tray_icon_remaining = g_ui.show_remaining;
+    g_ui.tray_icon_cached_light = g_ui.tray_icon_light;
 }
 
 void save_layout() {
@@ -3105,6 +3285,9 @@ void save_layout() {
     json += ",\"time_24h\":" + std::string(g_ui.use_24_hour ? "1" : "0");
     json += ",\"always_on_top\":" + std::string(g_ui.always_on_top ? "1" : "0");
     json += ",\"tray_main\":" + std::to_string(g_ui.tray_main_model);
+    json += ",\"tray_light\":" + std::string(g_ui.tray_icon_light ? "1" : "0");
+    json += ",\"settings_tab\":" + std::to_string(g_ui.settings_tab);
+    json += ",\"animations\":" + std::string(g_ui.animations_enabled ? "1" : "0");
     json += ",\"update_check\":" + std::string(g_ui.update_check_enabled ? "1" : "0");
     json += ",\"update_ignored\":\"" + json_escape(g_ui.update_ignored_version) + "\"";
     json += "}";
@@ -3289,6 +3472,8 @@ void remove_provider_slot(int index) {
     }
     g_ui.meter_pinned[index] = false;
     g_ui.meter_returning[index] = false;
+    g_ui.meter_drop_hover[index] = false;
+    g_ui.dock_drop_anim[index] = 0.0f;
     g_ui.meter_card_open[index] = false;
     g_ui.meter_anim[index] = 0;
     g_ui.meter_screen_x[index] = 0;
@@ -3471,6 +3656,27 @@ void handle_click(float x, float y) {
         return;
     }
     if (g_ui.settings_open) {
+        if (contains(g_ui.settings_models_tab, x, y)) {
+            if (g_ui.settings_tab != 0) { g_ui.settings_tab = 0; save_layout(); set_target_height(wanted_panel_height()); apply_layout(); }
+            return;
+        }
+        if (contains(g_ui.settings_preferences_tab, x, y)) {
+            if (g_ui.settings_tab != 1) { g_ui.settings_tab = 1; save_layout(); set_target_height(wanted_panel_height()); apply_layout(); }
+            return;
+        }
+        if (contains(g_ui.settings_animation_toggle, x, y)) {
+            g_ui.animations_enabled = !g_ui.animations_enabled;
+            if (!g_ui.animations_enabled) g_ui.ring_time = 0;
+            save_layout();
+            return;
+        }
+        if (contains(g_ui.settings_tray_icon_mode, x, y)) {
+            g_ui.tray_icon_light = !g_ui.tray_icon_light;
+            if (g_ui.tray_icon_style_entry) SDL_SetTrayEntryChecked(g_ui.tray_icon_style_entry, g_ui.tray_icon_light);
+            save_layout();
+            sync_tray_icon();
+            return;
+        }
         if (contains(g_ui.settings_fill_toggle, x, y)) {
             g_ui.show_remaining = !g_ui.show_remaining;
             save_layout();
@@ -3751,6 +3957,7 @@ void handle_mouse_motion() {
             float move_x = gx - g_ui.meter_press_x;
             float move_y = gy - g_ui.meter_press_y;
             if (move_x * move_x + move_y * move_y > 36.0f * scale * scale) g_ui.drag_moved = true;
+            g_ui.meter_drop_hover[index] = global_point_in_dock(gx, gy);
             g_ui.meter_screen_x[index] = static_cast<int>(std::lround(gx - static_cast<float>(g_ui.grab_x) * scale));
             g_ui.meter_screen_y[index] = static_cast<int>(std::lround(gy - static_cast<float>(g_ui.grab_y) * scale));
             sync_card_windows();
@@ -3834,6 +4041,9 @@ void load_layout() {
         int value = static_cast<int>(*main);
         if (value >= 0 && value < kProviderCount) g_ui.tray_main_model = value;
     }
+    if (auto light = json_number(*raw, "tray_light")) g_ui.tray_icon_light = *light != 0;
+    if (auto tab = json_number(*raw, "settings_tab")) g_ui.settings_tab = static_cast<int>(*tab) == 1 ? 1 : 0;
+    if (auto animations = json_number(*raw, "animations")) g_ui.animations_enabled = *animations != 0;
     if (auto updates = json_number(*raw, "update_check")) g_ui.update_check_enabled = *updates != 0;
     g_ui.update_ignored_version = json_string(*raw, "update_ignored").value_or("");
     std::lock_guard<std::mutex> lock(g_app.mutex);
@@ -4101,7 +4311,9 @@ int main(int argc, char** argv) {
         }
         sync_card_windows();
 
-        if (g_ui.visible && g_ui.dragging_model < 0 && g_ui.reorder_slot < 0 && g_ui.pending_ring < 0) {
+        bool dock_drop_layout = false;
+        for (int i = 0; i < kProviderCount; ++i) if (g_ui.meter_drop_hover[i] || g_ui.meter_returning[i] || g_ui.dock_drop_anim[i] > 0.001f) { dock_drop_layout = true; break; }
+        if (g_ui.visible && (g_ui.dragging_model < 0 || dock_drop_layout) && g_ui.reorder_slot < 0 && g_ui.pending_ring < 0) {
             int wanted_height = wanted_panel_height();
             if (g_ui.target_height != wanted_height || g_ui.panel_height != g_ui.target_height) apply_layout();
         }
