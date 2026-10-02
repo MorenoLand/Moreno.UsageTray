@@ -19,6 +19,7 @@ struct IconSet {
     SDL_Texture* gear = nullptr;
     SDL_Texture* pin = nullptr;
     SDL_Texture* star = nullptr;
+    SDL_Texture* flame = nullptr;
 };
 
 static std::vector<IconSet> g_sets;
@@ -101,6 +102,7 @@ void icons_load(SDL_Renderer* renderer) {
     set.gear = rasterize(renderer, find_svg("settings.svg"), true, size);
     set.pin = rasterize(renderer, find_svg("pin.svg"), true, size);
     set.star = rasterize(renderer, find_svg("star.svg"), true, size);
+    set.flame = rasterize(renderer, R"(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#FFFFFF" d="M12 2C13 7 18 8 18 14a6 6 0 0 1-12 0c0-3 2-5 4-7 0 3 1 4 2 4 2-2 1-5 0-9Z"/></svg>)", false, 96);
     g_sets.push_back(set);
 }
 
@@ -118,6 +120,7 @@ void icons_unload_renderer(SDL_Renderer* renderer) {
         if (it->gear) SDL_DestroyTexture(it->gear);
         if (it->pin) SDL_DestroyTexture(it->pin);
         if (it->star) SDL_DestroyTexture(it->star);
+        if (it->flame) SDL_DestroyTexture(it->flame);
         g_sets.erase(it);
         break;
     }
@@ -133,6 +136,7 @@ void icons_unload() {
         if (set.gear) SDL_DestroyTexture(set.gear);
         if (set.pin) SDL_DestroyTexture(set.pin);
         if (set.star) SDL_DestroyTexture(set.star);
+        if (set.flame) SDL_DestroyTexture(set.flame);
     }
     g_sets.clear();
     g_renderer = nullptr;
@@ -147,6 +151,7 @@ SDL_Texture* icon_provider(int index) {
 SDL_Texture* icon_gear() { IconSet* set = current_set(); return set ? set->gear : nullptr; }
 SDL_Texture* icon_pin() { IconSet* set = current_set(); return set ? set->pin : nullptr; }
 SDL_Texture* icon_star() { IconSet* set = current_set(); return set ? set->star : nullptr; }
+SDL_Texture* icon_flame() { IconSet* set = current_set(); return set ? set->flame : nullptr; }
 
 void icons_draw(SDL_Texture* texture, float cx, float cy, float size) {
     if (!texture || !g_renderer) return;

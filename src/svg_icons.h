@@ -11,4 +11,5 @@ SDL_Texture* icon_provider(int index);
 SDL_Texture* icon_gear();
 SDL_Texture* icon_pin();
 SDL_Texture* icon_star();
+SDL_Texture* icon_flame();
 void icons_draw(SDL_Texture* texture, float cx, float cy, float size);

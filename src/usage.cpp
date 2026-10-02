@@ -678,10 +678,11 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
 
 void warm_provider(const std::string& provider) {
     std::string kind = oauth_provider_kind(provider);
+    if (kind != "openai" && kind != "anthropic" && kind != "glm") throw std::runtime_error("Gemini warm-up is unavailable: no verified Antigravity generation endpoint");
     if (kind == "glm") {
         auto api_key = load_api_key_provider(provider);
         if (!api_key) throw std::runtime_error("No GLM API key saved");
-        std::string body = R"({"model":"glm-5","messages":[{"role":"user","content":"."}]})";
+        std::string body = R"({"model":"glm-5","max_tokens":1,"messages":[{"role":"user","content":"."}]})";
         HttpResponse res = http_post_json(kGlmChatUrl, body, {
             {"Authorization", auth_header_value(*api_key)},
             {"Accept-Language", "en-US"},
@@ -709,7 +710,7 @@ void warm_provider(const std::string& provider) {
 
     if (kind == "anthropic") {
         std::string body = "{";
-        body += "\"model\":\"claude-sonnet-4-6\",";
+        body += "\"model\":\"claude-haiku-4-5-20251001\",";
         body += "\"max_tokens\":1,";
         body += "\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}],";
         body += "\"messages\":[{\"role\":\"user\",\"content\":\".\"}]";
@@ -730,9 +731,9 @@ void warm_provider(const std::string& provider) {
     std::string account_id = credentials->account_id;
     if (account_id.empty()) throw std::runtime_error("OpenAI account id missing; log in again");
     std::string body = "{";
-    body += "\"model\":\"gpt-5.5\",";
+    body += "\"model\":\"gpt-5.1-codex-mini\",";
     body += "\"store\":false,";
-    body += "\"stream\":false,";
+    body += "\"stream\":true,";
     body += "\"instructions\":\"You are a helpful assistant.\",";
     body += "\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\".\"}]}],";
     body += "\"text\":{\"verbosity\":\"low\"}";
@@ -749,6 +750,7 @@ void warm_provider(const std::string& provider) {
     if (res.status < 200 || res.status >= 300) {
         throw std::runtime_error("GPT warm request failed: HTTP " + std::to_string(res.status));
     }
+    if (res.body.find("response.completed") == std::string::npos) throw std::runtime_error("GPT warm request did not complete successfully");
 }
 
 std::string format_reset(long long reset_at_seconds) {
