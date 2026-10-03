@@ -1407,7 +1407,7 @@ bool global_point_in_window(SDL_Window* window, float x, float y) {
 }
 
 bool global_point_over_owned_window(float x, float y) {
-    if (global_point_in_window(g_ui.window, x, y)) return true;
+    if (g_ui.visible && global_point_in_window(g_ui.window, x, y)) return true;
     for (int i = 0; i < kProviderCount; ++i) {
         if (g_ui.card_window_visible[i] && global_point_in_window(g_ui.card_window[i], x, y)) return true;
         if (g_ui.meter_card_window_visible[i] && global_point_in_window(g_ui.meter_card_window[i], x, y)) return true;
@@ -1420,8 +1420,8 @@ void poll_dismiss() {
     bool down = (SDL_GetGlobalMouseState(&gx, &gy) & SDL_BUTTON_LMASK) != 0;
     bool pressed = down && !g_ui.prev_global_down;
     g_ui.prev_global_down = down;
-    if (!g_ui.visible || g_ui.dragging || g_ui.dragging_model >= 0 || g_ui.reorder_slot >= 0 || g_ui.click_armed) return;
-    if (now_ms() - g_ui.shown_at_ms < 800) return;
+    if (g_ui.dragging || g_ui.dragging_model >= 0 || g_ui.reorder_slot >= 0 || g_ui.click_armed) return;
+    if (g_ui.visible && now_ms() - g_ui.shown_at_ms < 800) return;
     if (!pressed) return;
     if (global_point_over_owned_window(gx, gy)) return;
     hide_panel();
@@ -4449,8 +4449,8 @@ int main(int argc, char** argv) {
         for (int i = 0; i < kProviderCount; ++i) if (g_ui.model_open[i] || g_ui.meter_pinned[i]) { cards_open = true; break; }
         if (g_ui.visible || cards_open) tick_ui(dt);
         raise_dragged_meter();
+        poll_dismiss();
         if (g_ui.visible) {
-            poll_dismiss();
             draw_panel();
         }
         if (g_ui.visible || cards_open) draw_card_windows();

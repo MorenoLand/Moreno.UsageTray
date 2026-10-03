@@ -717,12 +717,14 @@ void warm_provider(const std::string& provider) {
         body += "}";
         HttpResponse res = http_post_json(kClaudeMessagesUrl, body, {
             {"Authorization", "Bearer " + credentials->access},
+            {"anthropic-version", "2023-06-01"},
             {"anthropic-beta", "claude-code-20250219,oauth-2025-04-20"},
             {"User-Agent", "claude-cli/2.1.75"},
             {"x-app", "cli"},
         });
         if (res.status < 200 || res.status >= 300) {
-            throw std::runtime_error("Claude warm request failed: HTTP " + std::to_string(res.status));
+            std::string message = json_string(object_for_key(res.body, "error"), "message").value_or("");
+            throw std::runtime_error("Claude warm request failed: HTTP " + std::to_string(res.status) + (message.empty() ? "" : " - " + message));
         }
         return;
     }
