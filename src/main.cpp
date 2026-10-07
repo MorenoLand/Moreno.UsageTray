@@ -1023,7 +1023,22 @@ void reassert_window_z_order(SDL_Window* window) {
     if (!window || !g_ui.always_on_top) return;
     HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
     if (!hwnd || !IsWindowVisible(hwnd)) return;
-    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) return;
+    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) {
+        RECT bounds{};
+        if (!GetWindowRect(hwnd, &bounds)) return;
+        bool obscured = false;
+        for (HWND above = GetWindow(hwnd, GW_HWNDPREV); above; above = GetWindow(above, GW_HWNDPREV)) {
+            if (!IsWindowVisible(above) || IsIconic(above)) continue;
+            DWORD process_id = 0;
+            GetWindowThreadProcessId(above, &process_id);
+            if (process_id == GetCurrentProcessId()) continue;
+            DWORD cloaked = 0;
+            if (SUCCEEDED(DwmGetWindowAttribute(above, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) continue;
+            RECT other{}, overlap{};
+            if (GetWindowRect(above, &other) && IntersectRect(&overlap, &bounds, &other)) { obscured = true; break; }
+        }
+        if (!obscured) return;
+    }
     SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 #else
     (void)window;
@@ -1651,8 +1666,14 @@ void warm_async_for(int provider_index) {
                 state.status = "Warm request sent";
                 state.warm_state = 2;
                 state.warm_completed_ms = now_ms();
-                state.busy = false;
                 state.last_refresh_ms = 0;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            {
+                std::lock_guard<std::mutex> lock(g_app.mutex);
+                auto& state = g_app.providers[provider_index];
+                if (state.operation_id != operation_id) return;
+                state.busy = false;
             }
             refresh_usage_async_for(provider_index, true);
         } catch (const std::exception& e) {
