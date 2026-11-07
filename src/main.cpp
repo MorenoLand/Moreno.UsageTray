@@ -115,6 +115,9 @@ struct ProviderState {
     int warm_state = 0;
     long long warm_completed_ms = 0;
     std::string warm_error;
+    long long warm_at_ms = 0;
+    bool warm_auto = false;
+    long long warm_auto_last_ms = 0;
 };
 
 struct AppState {
@@ -176,6 +179,9 @@ struct UiState {
     bool callout_open = true;
     bool settings_open = false;
     bool api_key_mode = false;
+    bool schedule_input = false;
+    int schedule_slot = -1;
+    std::string schedule_error;
     bool api_input_focused = false;
     bool oauth_code_mode = false;
     bool oauth_code_input_focused = false;
@@ -1695,6 +1701,7 @@ void login_async_for(int provider_index) {
         return;
     }
     if (kind == 2) {
+        g_ui.schedule_input = false;
         g_ui.api_key_slot = provider_index;
         if (g_ui.visible) anchor_current_bottom();
         g_ui.api_key_mode = true;
@@ -1738,7 +1745,208 @@ void login_async_for(int provider_index) {
     }).detach();
 }
 
+// Accepts a countdown ("20", "20m", "1h30", "in 2 hours") or a clock time ("3am", "3:15 pm", "15:30").
+std::optional<long long> parse_warm_time(std::string input, long long now) {
+    for (auto& c : input) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    input = trim_copy(input);
+    for (const char* prefix : {"in ", "at "}) {
+        if (input.rfind(prefix, 0) == 0) input = trim_copy(input.substr(3));
+    }
+    if (input.empty()) return std::nullopt;
+    std::string compact;
+    for (char c : input) if (!std::isspace(static_cast<unsigned char>(c))) compact += c;
+    bool suffix = compact.size() > 2 && (compact.compare(compact.size() - 2, 2, "am") == 0 || compact.compare(compact.size() - 2, 2, "pm") == 0);
+    if (suffix || compact.find(':') != std::string::npos) {
+        bool pm = false, has_suffix = false;
+        if (suffix) { pm = compact.back() == 'p'; has_suffix = true; compact.resize(compact.size() - 2); }
+        size_t colon = compact.find(':');
+        std::string hour_text = compact.substr(0, colon);
+        std::string minute_text = colon == std::string::npos ? "0" : compact.substr(colon + 1);
+        if (hour_text.empty() || minute_text.empty() || hour_text.size() > 2 || minute_text.size() > 2) return std::nullopt;
+        for (char c : hour_text + minute_text) if (!std::isdigit(static_cast<unsigned char>(c))) return std::nullopt;
+        int hour = std::stoi(hour_text), minute = std::stoi(minute_text);
+        if (minute > 59) return std::nullopt;
+        if (has_suffix) {
+            if (hour < 1 || hour > 12) return std::nullopt;
+            hour = hour % 12 + (pm ? 12 : 0);
+        } else if (hour > 23) return std::nullopt;
+        std::tm local = localtime_portable(static_cast<std::time_t>(now / 1000));
+        local.tm_hour = hour; local.tm_min = minute; local.tm_sec = 0; local.tm_isdst = -1;
+        long long target = static_cast<long long>(std::mktime(&local)) * 1000;
+        if (target <= now) {
+            local.tm_mday += 1; local.tm_isdst = -1;
+            target = static_cast<long long>(std::mktime(&local)) * 1000;
+        }
+        return target;
+    }
+    long long seconds = 0;
+    size_t i = 0;
+    while (i < compact.size()) {
+        if (!std::isdigit(static_cast<unsigned char>(compact[i]))) return std::nullopt;
+        long long value = 0;
+        while (i < compact.size() && std::isdigit(static_cast<unsigned char>(compact[i])) && value < 100000) value = value * 10 + (compact[i++] - '0');
+        char unit = 0;
+        if (i < compact.size()) {
+            unit = compact[i];
+            if (unit != 'h' && unit != 'm' && unit != 's') return std::nullopt;
+            while (i < compact.size() && std::isalpha(static_cast<unsigned char>(compact[i]))) ++i;
+        } else unit = 'm';
+        seconds += value * (unit == 'h' ? 3600 : unit == 'm' ? 60 : 1);
+    }
+    if (seconds <= 0 || seconds > 7 * 24 * 3600) return std::nullopt;
+    return now + seconds * 1000;
+}
+
+std::string format_warm_clock(long long at_ms) {
+    std::time_t t = static_cast<std::time_t>(at_ms / 1000);
+    std::tm local = localtime_portable(t);
+    std::tm today = localtime_portable(static_cast<std::time_t>(now_ms() / 1000));
+    std::ostringstream out;
+    if (local.tm_yday != today.tm_yday || local.tm_year != today.tm_year) out << std::put_time(&local, "%a ");
+    out << std::put_time(&local, "%I:%M %p");
+    std::string s = out.str();
+    size_t pos = s.find_first_of("0123456789");
+    if (pos != std::string::npos && s[pos] == '0') s.erase(pos, 1);
+    return s;
+}
+
+std::string warm_schedule_label(const ProviderState& state) {
+    if (state.warm_at_ms > 0) {
+        long long minutes = std::max(1LL, (state.warm_at_ms - now_ms() + 59999) / 60000);
+        std::string in = minutes < 60 ? std::to_string(minutes) + " min" : std::to_string(minutes / 60) + "h " + std::to_string(minutes % 60) + "m";
+        return "Warm at " + format_warm_clock(state.warm_at_ms) + " (in " + in + ")";
+    }
+    if (state.warm_auto) return "Auto-warm when session ends";
+    return "";
+}
+
+bool warm_eligible(int index, const ProviderState& state) {
+    int kind = kind_of(index);
+    return state.primary_available && (kind == 1 || state.primary_row == "5 hour") && kind >= 0 && kind <= 3;
+}
+
+void set_warm_at(int index, long long at_ms) {
+    std::lock_guard<std::mutex> lock(g_app.mutex);
+    g_app.providers[index].warm_at_ms = at_ms;
+}
+
+void open_schedule_input(int index) {
+    g_ui.schedule_input = true;
+    g_ui.schedule_slot = index;
+    g_ui.schedule_error.clear();
+    if (g_ui.visible) anchor_current_bottom();
+    g_ui.api_key_mode = true;
+    g_ui.api_input_focused = true;
+    g_ui.api_key_input.clear();
+    set_target_height(wanted_panel_height());
+    SDL_StartTextInput(g_ui.window);
+    if (!g_ui.visible) show_panel();
+}
+
+void close_schedule_input() {
+    g_ui.schedule_input = false;
+    g_ui.schedule_error.clear();
+    g_ui.api_key_mode = false;
+    g_ui.api_input_focused = false;
+    g_ui.api_key_input.clear();
+    set_target_height(wanted_panel_height());
+    SDL_StopTextInput(g_ui.window);
+}
+
+void submit_schedule_input() {
+    std::optional<long long> at = parse_warm_time(g_ui.api_key_input, now_ms());
+    if (!at) {
+        g_ui.schedule_error = "Try 20m, 1h30, 3am or 15:30";
+        return;
+    }
+    set_warm_at(g_ui.schedule_slot, *at);
+    close_schedule_input();
+}
+
+void open_warm_menu(SDL_Window* window, int index) {
+    if (index < 0 || index >= kProviderCount) return;
+    std::string pending;
+    bool auto_on = false, logged_in = false;
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        pending = g_app.providers[index].warm_at_ms > 0 ? warm_schedule_label(g_app.providers[index]) : "";
+        auto_on = g_app.providers[index].warm_auto;
+        logged_in = g_app.providers[index].logged_in;
+    }
+    if (!logged_in) return;
+    int command = 5;
+#if defined(_WIN32)
+    HWND hwnd = window ? static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr)) : nullptr;
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, 1, L"Warm now");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 2, L"Warm in 5 minutes");
+    AppendMenuW(menu, MF_STRING, 3, L"Warm in 20 minutes");
+    AppendMenuW(menu, MF_STRING, 4, L"Warm in 1 hour");
+    AppendMenuW(menu, MF_STRING, 5, L"Schedule... (time or countdown)");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 6, L"Warm when this session ends");
+    AppendMenuW(menu, MF_STRING | (auto_on ? MF_CHECKED : 0), 7, L"Auto-warm every session");
+    if (!pending.empty()) {
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        std::wstring label = L"Cancel: " + std::wstring(pending.begin(), pending.end());
+        AppendMenuW(menu, MF_STRING, 8, label.c_str());
+    }
+    POINT pt{};
+    GetCursorPos(&pt);
+    if (hwnd) SetForegroundWindow(hwnd);
+    command = static_cast<int>(TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr));
+    if (hwnd) PostMessage(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+#else
+    (void)window; (void)pending; (void)auto_on;
+#endif
+    switch (command) {
+    case 1: warm_async_for(index); break;
+    case 2: set_warm_at(index, now_ms() + 5 * 60 * 1000); break;
+    case 3: set_warm_at(index, now_ms() + 20 * 60 * 1000); break;
+    case 4: set_warm_at(index, now_ms() + 60 * 60 * 1000); break;
+    case 5: open_schedule_input(index); break;
+    case 6: {
+        long long reset = 0;
+        { std::lock_guard<std::mutex> lock(g_app.mutex); reset = g_app.providers[index].primary_reset; }
+        if (reset * 1000 > now_ms()) set_warm_at(index, reset * 1000 + 2000);
+        else warm_async_for(index);
+        break;
+    }
+    case 7: { std::lock_guard<std::mutex> lock(g_app.mutex); g_app.providers[index].warm_auto = !g_app.providers[index].warm_auto; break; }
+    case 8: set_warm_at(index, 0); break;
+    default: break;
+    }
+}
+
+void tick_warm_schedules() {
+    static long long last = 0;
+    long long now = now_ms();
+    if (now - last < 1000) return;
+    last = now;
+    for (int i = 0; i < kProviderCount; ++i) {
+        bool fire = false;
+        {
+            std::lock_guard<std::mutex> lock(g_app.mutex);
+            auto& state = g_app.providers[i];
+            if (!state.logged_in || state.busy) continue;
+            if (state.warm_at_ms > 0 && now >= state.warm_at_ms) {
+                state.warm_at_ms = 0;
+                fire = true;
+            } else if (state.warm_auto && state.last_refresh_ms > 0 && warm_eligible(i, state) && now - state.warm_auto_last_ms >= 10 * 60 * 1000 &&
+                       session_inactive(i, state.primary_used, state.primary_reset)) {
+                state.warm_auto_last_ms = now;
+                fire = true;
+            }
+        }
+        if (fire) warm_async_for(i);
+    }
+}
+
 void save_glm_key() {
+    if (g_ui.schedule_input) { submit_schedule_input(); return; }
     std::string key = trim_copy(g_ui.api_key_input);
     if (key.empty()) return;
     int slot = g_ui.api_key_slot;
@@ -2186,7 +2394,7 @@ void draw_model_card_content(int index, float card_x, float card_y, const Provid
     g_ui.model_callout_rect[index] = g_ui.callout_rect;
     g_ui.model_warm_button[index] = {};
     g_ui.card_warm_button[index] = {};
-    if (state.primary_available && (kind_of(index) == 1 || state.primary_row == "5 hour") && kind_of(index) >= 0 && kind_of(index) <= 3) {
+    if (warm_eligible(index, state)) {
         Rect flame{card_x + static_cast<float>(kCalloutWidth) - 90, card_y + 10, 28, 28};
         g_ui.model_warm_button[index] = flame;
         g_ui.card_warm_button[index] = flame;
@@ -2222,6 +2430,9 @@ void draw_model_card_content(int index, float card_x, float card_y, const Provid
         if (state.warm_state == 2) g_ui.draw_opacity *= std::clamp((2400.0f - static_cast<float>(now_ms() - state.warm_completed_ms)) / 900.0f, 0.0f, 1.0f);
         text(card_x + 18, card_y + 36, clip_text(warm_label, 290, false, true), state.warm_state == 3 ? 255 : 142, state.warm_state == 3 ? 96 : 142, state.warm_state == 3 ? 96 : 147, false, true);
         g_ui.draw_opacity = previous_opacity;
+    } else {
+        std::string scheduled = warm_schedule_label(state);
+        if (!scheduled.empty()) text(card_x + 18, card_y + 36, clip_text(scheduled, 290, false, true), 255, 176, 96, false, true);
     }
     float y = card_y + 48;
     if (state.primary_available) { row(y, state.primary_row, true, state.primary_used, state.primary_reset, false); y += 56; }
@@ -2365,13 +2576,15 @@ void draw_panel() {
                     button(g_ui.update_later, "Later", true);
                 }
             } else if (g_ui.api_key_mode) {
-                text(card_x + 18, card_y + 16, "GLM API key", 245, 245, 247, true);
-                text(card_x + 18, card_y + 40, "Paste key. Saved in the platform secret store.", 142, 142, 147, false, true);
+                bool scheduling = g_ui.schedule_input;
+                text(card_x + 18, card_y + 16, scheduling ? "Schedule warm" : "GLM API key", 245, 245, 247, true);
+                if (scheduling && !g_ui.schedule_error.empty()) text(card_x + 18, card_y + 40, g_ui.schedule_error, 255, 96, 96, false, true);
+                else text(card_x + 18, card_y + 40, scheduling ? "A time (3am, 15:30) or countdown (20m, 1h30)." : "Paste key. Saved in the platform secret store.", 142, 142, 147, false, true);
                 g_ui.api_input = {card_x + 18, card_y + 68, 300, 32};
-                draw_input_field(g_ui.api_input, masked_input_text(g_ui.api_key_input, 280), g_ui.api_input_focused);
+                draw_input_field(g_ui.api_input, scheduling ? clip_text(g_ui.api_key_input, 280, false, true) : masked_input_text(g_ui.api_key_input, 280), g_ui.api_input_focused);
                 g_ui.api_ok = {card_x + 18, card_y + 112, 144, 30};
                 g_ui.api_cancel = {card_x + 174, card_y + 112, 144, 30};
-                button(g_ui.api_ok, "Save", !g_ui.api_key_input.empty());
+                button(g_ui.api_ok, scheduling ? "Schedule" : "Save", !g_ui.api_key_input.empty());
                 button(g_ui.api_cancel, "Cancel", true);
             } else if (g_ui.oauth_code_mode) {
                 bool grok = oauth_provider_kind(g_ui.oauth_session.provider) == "grok";
@@ -3698,6 +3911,10 @@ void handle_right_click(float x, float y) {
             return;
         }
     }
+    for (int i = 0; i < kProviderCount; ++i) if (contains(g_ui.model_warm_button[i], x, y)) {
+        open_warm_menu(g_ui.window, i);
+        return;
+    }
     request_settings(!g_ui.settings_target);
     apply_layout();
 }
@@ -3747,6 +3964,7 @@ void handle_click(float x, float y) {
             SDL_StartTextInput(g_ui.window);
         } else if (contains(g_ui.api_ok, x, y)) save_glm_key();
         else if (contains(g_ui.api_cancel, x, y)) {
+            g_ui.schedule_input = false;
             g_ui.api_key_mode = false;
             g_ui.api_input_focused = false;
             set_target_height(wanted_panel_height());
@@ -4331,6 +4549,9 @@ int main(int argc, char** argv) {
                 if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
                     card_event_logical(meter_card_index, event, &ex, &ey, g_ui.meter_card_renderer[meter_card_index]);
                     handle_meter_card_mouse_down(meter_card_index, ex, ey);
+                } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_RIGHT) {
+                    card_event_logical(meter_card_index, event, &ex, &ey, g_ui.meter_card_renderer[meter_card_index]);
+                    if (contains(g_ui.card_warm_button[meter_card_index], ex, ey)) open_warm_menu(g_ui.meter_card_window[meter_card_index], meter_card_index);
                 } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
                     handle_mouse_motion();
                 } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
@@ -4344,7 +4565,10 @@ int main(int argc, char** argv) {
                     card_event_logical(card_index, event, &ex, &ey);
                     handle_card_mouse_down(card_index, ex, ey);
                 } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_RIGHT) {
-                    if (g_ui.meter_pinned[card_index]) {
+                    card_event_logical(card_index, event, &ex, &ey);
+                    if (!g_ui.meter_pinned[card_index] && contains(g_ui.card_warm_button[card_index], ex, ey)) {
+                        open_warm_menu(g_ui.card_window[card_index], card_index);
+                    } else if (g_ui.meter_pinned[card_index]) {
                         begin_meter_return(card_index);
                         apply_layout();
                         sync_card_windows();
@@ -4410,6 +4634,7 @@ int main(int argc, char** argv) {
                     else if (event.key.key == SDLK_ESCAPE) {
                         if (oauth_code) cancel_oauth_code_login();
                         else {
+                            g_ui.schedule_input = false;
                             g_ui.api_key_mode = false;
                             g_ui.api_input_focused = false;
                             set_target_height(wanted_panel_height());
@@ -4427,6 +4652,7 @@ int main(int argc, char** argv) {
         sync_tray_icon();
         if (g_refresh_requested.exchange(false)) refresh_usage_async_for(selected_provider(), true);
         if (g_warm_requested.exchange(false)) warm_async_for(selected_provider());
+        tick_warm_schedules();
         if ((g_ui.pending_ring >= 0 || g_ui.reorder_slot >= 0) && !(SDL_GetGlobalMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK)) handle_mouse_up(0, 0);
         if (g_ui.dragging_model >= 0 && !(SDL_GetGlobalMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK)) {
             if (g_ui.dragging_meter_card) handle_meter_card_mouse_up(g_ui.dragging_model);
