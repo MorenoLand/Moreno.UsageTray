@@ -46,6 +46,10 @@ static constexpr const char* kGrokTokenUrl = "https://auth.x.ai/oauth2/token";
 static constexpr const char* kGrokRedirectUri = "http://127.0.0.1:56121/callback";
 static constexpr const char* kGrokScope = "openid profile email offline_access grok-cli:access api:access";
 
+static constexpr const char* kOpenCodeClientId = "opencode-cli";
+static constexpr const char* kOpenCodeDeviceCodeUrl = "https://opencode.ai/console/auth/device/code";
+static constexpr const char* kOpenCodeDeviceTokenUrl = "https://opencode.ai/console/auth/device/token";
+
 struct GeminiOAuthConfig {
     std::string client_id;
     std::string client_secret;
@@ -422,6 +426,60 @@ std::string gemini_discover_project(const std::string& access_token) {
     throw std::runtime_error("Gemini project discovery failed");
 }
 
+OpenCodeDeviceSession opencode_device_begin() {
+    HttpResponse res = http_post_form(kOpenCodeDeviceCodeUrl, {
+        {"client_id", kOpenCodeClientId},
+        {"supports_org_scope", "true"},
+    });
+    if (res.status < 200 || res.status >= 300) {
+        throw std::runtime_error("OpenCode device login failed: HTTP " + std::to_string(res.status));
+    }
+    OpenCodeDeviceSession session;
+    session.device_code = json_string(res.body, "device_code").value_or("");
+    session.user_code = json_string(res.body, "user_code").value_or("");
+    session.verify_url = json_string(res.body, "verification_uri_complete").value_or("");
+    if (session.verify_url.empty()) session.verify_url = json_string(res.body, "verification_uri").value_or("");
+    if (session.verify_url.rfind("http", 0) != 0) session.verify_url = "https://opencode.ai" + session.verify_url;
+    double expires_in = json_number(res.body, "expires_in").value_or(600);
+    double interval = json_number(res.body, "interval").value_or(5);
+    session.expires_ms = now_ms() + static_cast<long long>(expires_in * 1000.0);
+    session.interval_seconds = std::max(1, static_cast<int>(interval));
+    if (session.device_code.empty() || session.verify_url.empty()) {
+        throw std::runtime_error("OpenCode device login response missing fields");
+    }
+    return session;
+}
+
+OAuthCredentials opencode_device_wait(const OpenCodeDeviceSession& session) {
+    int interval = session.interval_seconds;
+    while (now_ms() < session.expires_ms) {
+        std::this_thread::sleep_for(std::chrono::seconds(interval));
+        HttpResponse res = http_post_form(kOpenCodeDeviceTokenUrl, {
+            {"grant_type", "urn:ietf:params:oauth:grant-type:device_code"},
+            {"device_code", session.device_code},
+            {"client_id", kOpenCodeClientId},
+        });
+        std::string access = json_string(res.body, "access_token").value_or("");
+        if (res.status >= 200 && res.status < 300 && !access.empty()) {
+            std::string refresh = json_string(res.body, "refresh_token").value_or("");
+            double expires_in = json_number(res.body, "expires_in").value_or(0);
+            if (expires_in <= 0) throw std::runtime_error("OpenCode login response missing fields");
+            OAuthCredentials credentials;
+            credentials.access = access;
+            credentials.refresh = refresh;
+            credentials.expires_ms = now_ms() + static_cast<long long>(expires_in * 1000.0);
+            credentials.account_id = json_string(res.body, "org_id").value_or("");
+            return credentials;
+        }
+        std::string error = json_string(res.body, "error").value_or("");
+        if (error == "authorization_pending") continue;
+        if (error == "slow_down") { interval += 5; continue; }
+        if (!error.empty()) throw std::runtime_error("OpenCode login failed: " + error);
+        throw std::runtime_error("OpenCode login failed: HTTP " + std::to_string(res.status));
+    }
+    throw std::runtime_error("OpenCode login expired");
+}
+
 std::string oauth_provider_kind(const std::string& name) {
     std::size_t p = name.rfind('_');
     if (p == std::string::npos || p == 0 || p + 1 >= name.size()) return name;
@@ -437,8 +495,8 @@ OAuthCredentials oauth_login_browser() {
 
 OAuthLoginSession oauth_prepare_login_provider(const std::string& provider) {
     std::string kind = oauth_provider_kind(provider);
-    if (kind == "glm") {
-        throw std::runtime_error("GLM OAuth is not configured yet");
+    if (kind == "glm" || kind == "opencode") {
+        throw std::runtime_error("This provider uses a different login flow");
     }
     OAuthLoginSession session;
     session.provider = provider;
@@ -516,6 +574,27 @@ OAuthCredentials oauth_refresh(const std::string& refresh_token) {
 
 OAuthCredentials oauth_refresh_provider(const std::string& provider, const std::string& refresh_token) {
     std::string kind = oauth_provider_kind(provider);
+    if (kind == "opencode") {
+        HttpResponse res = http_post_form(kOpenCodeDeviceTokenUrl, {
+            {"grant_type", "refresh_token"},
+            {"refresh_token", refresh_token},
+            {"client_id", kOpenCodeClientId},
+        });
+        if (res.status < 200 || res.status >= 300) {
+            throw std::runtime_error("OpenCode token refresh failed: HTTP " + std::to_string(res.status));
+        }
+        std::string access = json_string(res.body, "access_token").value_or("");
+        std::string refresh = json_string(res.body, "refresh_token").value_or(refresh_token);
+        double expires_in = json_number(res.body, "expires_in").value_or(0);
+        if (access.empty() || refresh.empty() || expires_in <= 0) throw std::runtime_error("OpenCode refresh response missing fields");
+        OAuthCredentials credentials;
+        credentials.access = access;
+        credentials.refresh = refresh;
+        credentials.expires_ms = now_ms() + static_cast<long long>(expires_in * 1000.0);
+        credentials.account_id = json_string(res.body, "org_id").value_or("");
+        save_credentials_provider(provider, credentials);
+        return credentials;
+    }
     if (kind == "glm") {
         throw std::runtime_error("GLM OAuth is not configured yet");
     }

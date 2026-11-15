@@ -12,6 +12,7 @@ provider's settings page.
 | GLM/Z.ai | Saved API key | 5 hour quota, MCP/tool requests |
 | Gemini/Antigravity | Google OAuth with hosted verification code | 5 hour, weekly |
 | Grok | Browser OAuth via auth.x.ai (Grok CLI) | Weekly Grok CLI |
+| OpenCode Go | Console API key or Console device sign-in | 5 hour, weekly, monthly |
 
 ## Platform Status
 
@@ -25,8 +26,9 @@ Backend notes:
 
 ## Security
 
-The tray UI never prints access tokens. GPT, Claude, Gemini, and Grok use OAuth
-tokens; GLM stores only the API key you enter.
+The tray UI never prints access tokens. GPT, Claude, Gemini, Grok, and OpenCode Go
+use OAuth tokens; GLM stores only the API key you enter, and OpenCode Go stores
+either its API key or its Console OAuth tokens.
 
 ## Build
 
@@ -111,6 +113,15 @@ with:
 Authorization: Bearer <key>
 ```
 
+OpenCode Go uses:
+
+```text
+https://opencode.ai/zen/go/v1/usage
+```
+
+with either an API key or Console OAuth access token. Console OAuth usage also
+sends `x-opencode-org-id: <org_id>`.
+
 ## OAuth Notes
 
 
@@ -143,6 +154,16 @@ Grok uses the public Grok CLI OAuth client against `auth.x.ai`:
 - Usage endpoint: `https://cli-chat-proxy.grok.com/v1/billing?format=credits`
 - Usage headers include `X-XAI-Token-Auth: xai-grok-cli`
 - The bar is the Grok CLI (`GrokBuild`) weekly product window from that payload; Grok web usage is not shown without its separate browser session
+
+OpenCode Go mirrors the desktop app's Console device sign-in:
+
+- Device code: `POST https://opencode.ai/console/auth/device/code`
+- Poll and refresh: `POST https://opencode.ai/console/auth/device/token`
+- Client id: `opencode-cli`
+- The browser page receives the returned `user_code`; the app opens the
+  `verification_uri_complete` URL automatically
+- Usage reads the Go allowance with the OAuth access token and the returned
+  `org_id` as `x-opencode-org-id`
 
 ## Debug
 

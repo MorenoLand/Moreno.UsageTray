@@ -15,7 +15,7 @@
 
 struct IconSet {
     SDL_Renderer* renderer = nullptr;
-    SDL_Texture* provider[5]{};
+    SDL_Texture* provider[6]{};
     SDL_Texture* gear = nullptr;
     SDL_Texture* pin = nullptr;
     SDL_Texture* star = nullptr;
@@ -68,7 +68,9 @@ static SDL_Texture* rasterize(SDL_Renderer* renderer, const std::string& raw, bo
         nsvgDelete(image);
         return nullptr;
     }
-    nsvgRasterize(rast, image, 0, 0, scale, pixels.data(), size, size, size * 4);
+    float offset_x = (static_cast<float>(size) - iw * scale) * 0.5f;
+    float offset_y = (static_cast<float>(size) - ih * scale) * 0.5f;
+    nsvgRasterize(rast, image, offset_x, offset_y, scale, pixels.data(), size, size, size * 4);
     nsvgDeleteRasterizer(rast);
     nsvgDelete(image);
     SDL_Surface* surface = SDL_CreateSurfaceFrom(size, size, SDL_PIXELFORMAT_RGBA32, pixels.data(), size * 4);
@@ -99,6 +101,7 @@ void icons_load(SDL_Renderer* renderer) {
     set.provider[2] = rasterize(renderer, find_svg("zai.svg"), true, size);
     set.provider[3] = rasterize(renderer, find_svg("gemini-color.svg"), false, size);
     set.provider[4] = rasterize(renderer, find_svg("grok.svg"), true, size);
+    set.provider[5] = rasterize(renderer, find_svg("opencode.svg"), false, size);
     set.gear = rasterize(renderer, find_svg("settings.svg"), true, size);
     set.pin = rasterize(renderer, find_svg("pin.svg"), true, size);
     set.star = rasterize(renderer, find_svg("star.svg"), true, size);
@@ -143,7 +146,7 @@ void icons_unload() {
 }
 
 SDL_Texture* icon_provider(int index) {
-    if (index < 0 || index > 4) return nullptr;
+    if (index < 0 || index > 5) return nullptr;
     IconSet* set = current_set();
     return set ? set->provider[index] : nullptr;
 }

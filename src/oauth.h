@@ -19,6 +19,14 @@ struct OAuthLoginSession {
     std::string client_secret;
 };
 
+struct OpenCodeDeviceSession {
+    std::string device_code;
+    std::string user_code;
+    std::string verify_url;
+    long long expires_ms = 0;
+    int interval_seconds = 5;
+};
+
 OAuthCredentials oauth_login_browser();
 OAuthCredentials oauth_refresh(const std::string& refresh_token);
 std::optional<OAuthCredentials> load_credentials();
@@ -33,6 +41,8 @@ OAuthLoginSession oauth_begin_manual_login_provider(const std::string& provider)
 OAuthCredentials oauth_finish_manual_login_provider(const OAuthLoginSession& session, const std::string& code);
 OAuthCredentials oauth_refresh_provider(const std::string& provider, const std::string& refresh_token);
 std::string gemini_discover_project(const std::string& access_token);
+OpenCodeDeviceSession opencode_device_begin();
+OAuthCredentials opencode_device_wait(const OpenCodeDeviceSession& session);
 std::optional<OAuthCredentials> load_credentials_provider(const std::string& provider);
 void save_credentials_provider(const std::string& provider, const OAuthCredentials& credentials);
 void clear_credentials_provider(const std::string& provider);

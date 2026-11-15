@@ -65,6 +65,7 @@ constexpr int kRingSize = 52;
 constexpr int kRingSlot = 78;
 constexpr int kDockFooter = 50;
 constexpr int kCalloutHeight = 168;
+constexpr int kCalloutThirdRowHeight = 224;
 constexpr int kCalloutSingleRowHeight = 112;
 constexpr int kSettingsRowHeight = 52;
 constexpr int kSettingsHeader = 78;
@@ -78,7 +79,7 @@ constexpr int kMeterWindowHeight = 76;
 constexpr int kTrayIconBaseSize = 16;
 constexpr int kDefaultRefreshIntervalSeconds = 300;
 constexpr float kDefaultUiScale = 1.0f;
-constexpr int kKindCount = 5;
+constexpr int kKindCount = 6;
 constexpr int kMaxSlots = 10;
 constexpr int kProviderCount = kMaxSlots;
 constexpr int kCardRadius = 20;
@@ -104,6 +105,7 @@ struct ProviderState {
     bool primary_available = true;
     bool secondary_available = true;
     bool tertiary_available = false;
+    bool tertiary_shown = false;
     double primary_used = 0;
     double secondary_used = 0;
     double tertiary_used = 0;
@@ -123,11 +125,11 @@ struct ProviderState {
 struct AppState {
     std::mutex mutex;
     ProviderState providers[kProviderCount];
-    bool enabled[kProviderCount] = {true, true, false, false, true};
-    int slot_kind[kProviderCount] = {0, 1, 2, 3, 4, -1, -1, -1, -1, -1};
+    bool enabled[kProviderCount] = {true, true, false, false, true, false};
+    int slot_kind[kProviderCount] = {0, 1, 2, 3, 4, 5, -1, -1, -1, -1};
     int slot_acct[kProviderCount]{};
     int dock_order[kProviderCount] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
-    bool listed[kKindCount] = {true, true, true, true, true};
+    bool listed[kKindCount] = {true, true, true, true, true, true};
     int selected = 0;
 };
 
@@ -181,7 +183,12 @@ struct UiState {
     bool api_key_mode = false;
     bool schedule_input = false;
     int schedule_slot = -1;
+    SDL_Window* schedule_window = nullptr;
     std::string schedule_error;
+    std::string schedule_text;
+    Rect schedule_box;
+    Rect schedule_ok;
+    Rect schedule_cancel;
     bool api_input_focused = false;
     bool oauth_code_mode = false;
     bool oauth_code_input_focused = false;
@@ -262,7 +269,7 @@ struct UiState {
     bool confirm_open = false;
     int confirm_index = -1;
     Rect confirm_cancel, confirm_delete;
-    Rect api_input, api_ok, api_cancel;
+    Rect api_input, api_ok, api_browser, api_cancel;
     Rect oauth_code_input_box, oauth_code_ok, oauth_code_cancel;
     float used_anim[kProviderCount]{};
     float ring_time = 0;
@@ -505,6 +512,7 @@ int slot_at_dock_y(float y) {
 }
 
 const char* kind_key(int kind) {
+    if (kind == 5) return "opencode";
     if (kind == 4) return "grok";
     if (kind == 3) return "gemini";
     if (kind == 2) return "glm";
@@ -525,6 +533,7 @@ std::string store_key(int slot) {
 
 const char* provider_label(int index) {
     int kind = kind_of(index);
+    if (kind == 5) return "OpenCode Go";
     if (kind == 4) return "Grok";
     if (kind == 3) return "Gemini";
     if (kind == 2) return "GLM";
@@ -543,6 +552,7 @@ const char* gpt_row_label(const RateWindow& window, const char* fallback) {
 
 const char* primary_row_label(int index) {
     int kind = kind_of(index);
+    if (kind == 5) return "5 hour";
     if (kind == 4) return "Grok CLI";
     if (kind == 2) return "5 hour";
     if (kind == 3) return "5 hour";
@@ -552,6 +562,7 @@ const char* primary_row_label(int index) {
 
 const char* secondary_row_label(int index) {
     int kind = kind_of(index);
+    if (kind == 5) return "Weekly";
     if (kind == 4) return "Grok Bot";
     if (kind == 2) return "Requests";
     if (kind == 3) return "Weekly";
@@ -559,18 +570,24 @@ const char* secondary_row_label(int index) {
     return "All models";
 }
 
+const char* tertiary_row_label(int index) {
+    return kind_of(index) == 5 ? "Monthly" : "Requests";
+}
+
 SDL_Color provider_accent(int index) {
     int kind = kind_of(index);
     if (kind == 1) return SDL_Color{232, 114, 42, 255};
     if (kind == 2) return SDL_Color{45, 212, 191, 255};
     if (kind == 3) return SDL_Color{168, 139, 250, 255};
+    if (kind == 5) return SDL_Color{107, 143, 255, 255};
     if (kind == 4) return SDL_Color{236, 236, 239, 255};
     return SDL_Color{232, 232, 234, 255};
 }
 
 bool provider_has_auth(int index) {
     std::string store = store_key(index);
-    if (kind_of(index) == 2) return load_api_key_provider(store).has_value();
+    int kind = kind_of(index);
+    if (kind == 2 || kind == 5) return load_api_key_provider(store).has_value() || load_credentials_provider(store).has_value();
     return load_credentials_provider(store).has_value();
 }
 
@@ -664,6 +681,7 @@ double display_percent(double used) {
 bool session_inactive(int index, double used, long long reset) { return kind_of(index) >= 0 && kind_of(index) <= 3 && (reset <= now_ms() / 1000 || (kind_of(index) == 3 && used <= 0.0)); }
 
 int callout_height_for(const ProviderState& state) {
+    if (state.tertiary_shown) return kCalloutThirdRowHeight;
     return state.primary_available && state.secondary_available ? kCalloutHeight : kCalloutSingleRowHeight;
 }
 
@@ -1482,6 +1500,9 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
             } else if (kind == 2) {
                 state.account = "GLM API key";
                 state.account_label = "GLM";
+            } else if (kind == 5) {
+                state.account = "OpenCode Go";
+                state.account_label = plan.empty() || plan == "unknown" ? "OpenCode Go" : plan;
             } else if (kind == 3) {
                 state.account = info.email.empty() ? "Gemini" : info.email;
                 state.account_label = "Gemini";
@@ -1498,10 +1519,11 @@ void refresh_usage_async_for(int provider_index, bool force = false) {
                 state.primary_row = gpt_row_label(info.primary, "5 hour");
                 state.secondary_row = gpt_row_label(info.secondary, "Weekly");
             }
-            state.tertiary_row = "Requests";
+            state.tertiary_row = tertiary_row_label(provider_index);
             state.primary_available = info.primary.available;
             state.secondary_available = info.secondary.available;
             state.tertiary_available = info.tertiary.available;
+            state.tertiary_shown = kind == 5 && info.tertiary.available;
             state.primary_used = std::clamp(info.primary.used_percent, 0.0, 100.0);
             state.secondary_used = std::clamp(info.secondary.used_percent, 0.0, 100.0);
             state.tertiary_used = std::clamp(info.tertiary.used_percent, 0.0, 100.0);
@@ -1700,8 +1722,7 @@ void login_async_for(int provider_index) {
         begin_oauth_code_login(provider_index);
         return;
     }
-    if (kind == 2) {
-        g_ui.schedule_input = false;
+    if (kind == 2 || kind == 5) {
         g_ui.api_key_slot = provider_index;
         if (g_ui.visible) anchor_current_bottom();
         g_ui.api_key_mode = true;
@@ -1830,31 +1851,25 @@ void set_warm_at(int index, long long at_ms) {
     g_app.providers[index].warm_at_ms = at_ms;
 }
 
-void open_schedule_input(int index) {
+void open_schedule_input(SDL_Window* window, int index) {
     g_ui.schedule_input = true;
     g_ui.schedule_slot = index;
+    g_ui.schedule_window = window;
     g_ui.schedule_error.clear();
-    if (g_ui.visible) anchor_current_bottom();
-    g_ui.api_key_mode = true;
-    g_ui.api_input_focused = true;
-    g_ui.api_key_input.clear();
-    set_target_height(wanted_panel_height());
-    SDL_StartTextInput(g_ui.window);
-    if (!g_ui.visible) show_panel();
+    g_ui.schedule_text.clear();
+    if (window) { SDL_RaiseWindow(window); SDL_StartTextInput(window); }
 }
 
 void close_schedule_input() {
     g_ui.schedule_input = false;
     g_ui.schedule_error.clear();
-    g_ui.api_key_mode = false;
-    g_ui.api_input_focused = false;
-    g_ui.api_key_input.clear();
-    set_target_height(wanted_panel_height());
-    SDL_StopTextInput(g_ui.window);
+    g_ui.schedule_text.clear();
+    if (g_ui.schedule_window) SDL_StopTextInput(g_ui.schedule_window);
+    g_ui.schedule_window = nullptr;
 }
 
 void submit_schedule_input() {
-    std::optional<long long> at = parse_warm_time(g_ui.api_key_input, now_ms());
+    std::optional<long long> at = parse_warm_time(g_ui.schedule_text, now_ms());
     if (!at) {
         g_ui.schedule_error = "Try 20m, 1h30, 3am or 15:30";
         return;
@@ -1907,7 +1922,7 @@ void open_warm_menu(SDL_Window* window, int index) {
     case 2: set_warm_at(index, now_ms() + 5 * 60 * 1000); break;
     case 3: set_warm_at(index, now_ms() + 20 * 60 * 1000); break;
     case 4: set_warm_at(index, now_ms() + 60 * 60 * 1000); break;
-    case 5: open_schedule_input(index); break;
+    case 5: open_schedule_input(window, index); break;
     case 6: {
         long long reset = 0;
         { std::lock_guard<std::mutex> lock(g_app.mutex); reset = g_app.providers[index].primary_reset; }
@@ -1926,6 +1941,8 @@ void tick_warm_schedules() {
     long long now = now_ms();
     if (now - last < 1000) return;
     last = now;
+    int slot = g_ui.schedule_slot;
+    if (g_ui.schedule_input && (slot < 0 || (!g_ui.card_window_visible[slot] && !g_ui.meter_card_window_visible[slot]))) close_schedule_input();
     for (int i = 0; i < kProviderCount; ++i) {
         bool fire = false;
         {
@@ -1945,18 +1962,18 @@ void tick_warm_schedules() {
     }
 }
 
-void save_glm_key() {
-    if (g_ui.schedule_input) { submit_schedule_input(); return; }
+void save_api_key() {
     std::string key = trim_copy(g_ui.api_key_input);
     if (key.empty()) return;
     int slot = g_ui.api_key_slot;
+    bool opencode = kind_of(slot) == 5;
     save_api_key_provider(store_key(slot), key);
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         auto& state = g_app.providers[slot];
         state.logged_in = true;
-        state.account = "GLM API key";
-        state.account_label = "GLM";
+        state.account = opencode ? "OpenCode Go" : "GLM API key";
+        state.account_label = opencode ? "Go" : "GLM";
         state.status = "API key saved";
         state.last_refresh_ms = 0;
     }
@@ -1965,6 +1982,53 @@ void save_glm_key() {
     set_target_height(wanted_panel_height());
     SDL_StopTextInput(g_ui.window);
     refresh_usage_async_for(slot, true);
+}
+
+void start_opencode_device_login() {
+    int slot = g_ui.api_key_slot;
+    if (kind_of(slot) != 5) return;
+    unsigned long long operation_id;
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        auto& state = g_app.providers[slot];
+        if (state.busy) return;
+        operation_id = ++state.operation_id;
+        state.busy = true;
+        state.status = "Waiting for OpenCode browser sign-in...";
+    }
+    g_ui.api_key_mode = false;
+    g_ui.api_input_focused = false;
+    g_ui.api_key_input.clear();
+    set_target_height(wanted_panel_height());
+    SDL_StopTextInput(g_ui.window);
+    std::thread([slot, operation_id] {
+        try {
+            OpenCodeDeviceSession session = opencode_device_begin();
+            open_browser(session.verify_url);
+            OAuthCredentials credentials = opencode_device_wait(session);
+            save_credentials_provider(store_key(slot), credentials);
+            {
+                std::lock_guard<std::mutex> lock(g_app.mutex);
+                auto& state = g_app.providers[slot];
+                if (state.operation_id != operation_id) return;
+                state.logged_in = true;
+                state.account = "OpenCode Go";
+                state.account_label = "Go";
+                state.status = "Login complete";
+                state.busy = false;
+                state.last_refresh_ms = 0;
+            }
+            refresh_usage_async_for(slot, true);
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lock(g_app.mutex);
+            auto& state = g_app.providers[slot];
+            if (state.operation_id != operation_id) return;
+            state.logged_in = provider_has_auth(slot);
+            state.status = e.what();
+            state.busy = false;
+            diagnostics_log(std::string(provider_key(slot)) + " device login error message=" + e.what());
+        }
+    }).detach();
 }
 
 void set_color(Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) {
@@ -2394,7 +2458,8 @@ void draw_model_card_content(int index, float card_x, float card_y, const Provid
     g_ui.model_callout_rect[index] = g_ui.callout_rect;
     g_ui.model_warm_button[index] = {};
     g_ui.card_warm_button[index] = {};
-    if (warm_eligible(index, state)) {
+    bool scheduling = g_ui.schedule_input && g_ui.schedule_slot == index;
+    if (warm_eligible(index, state) && !scheduling) {
         Rect flame{card_x + static_cast<float>(kCalloutWidth) - 90, card_y + 10, 28, 28};
         g_ui.model_warm_button[index] = flame;
         g_ui.card_warm_button[index] = flame;
@@ -2424,6 +2489,17 @@ void draw_model_card_content(int index, float card_x, float card_y, const Provid
         usage_track(card_x + 18, y + 20, static_cast<float>(kCalloutWidth) - 36, inactive ? (g_ui.show_remaining ? 100.0 : 0.0) : used, weekly);
         text(card_x + 18, y + 30, inactive ? "--" : std::to_string(static_cast<int>(std::round(display_percent(used)))) + (g_ui.show_remaining ? "% Left" : "% Used"), 174, 174, 178, false, true);
     };
+    if (scheduling) {
+        if (!g_ui.schedule_error.empty()) text(card_x + 18, card_y + 38, g_ui.schedule_error, 255, 96, 96, false, true);
+        else text(card_x + 18, card_y + 38, "A time (3am, 15:30) or countdown (20m, 1h30)", 142, 142, 147, false, true);
+        g_ui.schedule_box = {card_x + 18, card_y + 52, static_cast<float>(kCalloutWidth) - 36, 26};
+        draw_input_field(g_ui.schedule_box, clip_text(g_ui.schedule_text, kCalloutWidth - 56, false, true), true);
+        g_ui.schedule_ok = {card_x + 18, card_y + 82, 144, 24};
+        g_ui.schedule_cancel = {card_x + static_cast<float>(kCalloutWidth) - 162, card_y + 82, 144, 24};
+        button(g_ui.schedule_ok, "Schedule", !g_ui.schedule_text.empty());
+        button(g_ui.schedule_cancel, "Cancel", true);
+        return;
+    }
     if (state.warm_state != 0) {
         std::string warm_label = state.warm_state == 1 ? "Warming..." : (state.warm_state == 2 ? "Warm request sent" : "Retry: " + state.warm_error);
         float previous_opacity = g_ui.draw_opacity;
@@ -2436,7 +2512,8 @@ void draw_model_card_content(int index, float card_x, float card_y, const Provid
     }
     float y = card_y + 48;
     if (state.primary_available) { row(y, state.primary_row, true, state.primary_used, state.primary_reset, false); y += 56; }
-    if (state.secondary_available) row(y, state.secondary_row, true, state.secondary_used, state.secondary_reset, true);
+    if (state.secondary_available) { row(y, state.secondary_row, true, state.secondary_used, state.secondary_reset, true); y += 56; }
+    if (state.tertiary_shown) row(y, state.tertiary_row, true, state.tertiary_used, state.tertiary_reset, true);
 }
 
 void draw_panel() {
@@ -2576,15 +2653,16 @@ void draw_panel() {
                     button(g_ui.update_later, "Later", true);
                 }
             } else if (g_ui.api_key_mode) {
-                bool scheduling = g_ui.schedule_input;
-                text(card_x + 18, card_y + 16, scheduling ? "Schedule warm" : "GLM API key", 245, 245, 247, true);
-                if (scheduling && !g_ui.schedule_error.empty()) text(card_x + 18, card_y + 40, g_ui.schedule_error, 255, 96, 96, false, true);
-                else text(card_x + 18, card_y + 40, scheduling ? "A time (3am, 15:30) or countdown (20m, 1h30)." : "Paste key. Saved in the platform secret store.", 142, 142, 147, false, true);
+                bool opencode = kind_of(g_ui.api_key_slot) == 5;
+                text(card_x + 18, card_y + 16, opencode ? "OpenCode Go" : "GLM API key", 245, 245, 247, true);
+                text(card_x + 18, card_y + 40, opencode ? "Paste an API key or sign in with your account." : "Paste key. Saved in the platform secret store.", 142, 142, 147, false, true);
                 g_ui.api_input = {card_x + 18, card_y + 68, 300, 32};
-                draw_input_field(g_ui.api_input, scheduling ? clip_text(g_ui.api_key_input, 280, false, true) : masked_input_text(g_ui.api_key_input, 280), g_ui.api_input_focused);
-                g_ui.api_ok = {card_x + 18, card_y + 112, 144, 30};
-                g_ui.api_cancel = {card_x + 174, card_y + 112, 144, 30};
-                button(g_ui.api_ok, scheduling ? "Schedule" : "Save", !g_ui.api_key_input.empty());
+                draw_input_field(g_ui.api_input, masked_input_text(g_ui.api_key_input, 280), g_ui.api_input_focused);
+                g_ui.api_ok = {card_x + 18, card_y + 112, opencode ? 92.0f : 144.0f, 30};
+                g_ui.api_browser = opencode ? Rect{card_x + 116, card_y + 112, 100, 30} : Rect{};
+                g_ui.api_cancel = {card_x + (opencode ? 222.0f : 174.0f), card_y + 112, opencode ? 96.0f : 144.0f, 30};
+                button(g_ui.api_ok, "Save", !g_ui.api_key_input.empty());
+                if (opencode) button(g_ui.api_browser, "Browser", true);
                 button(g_ui.api_cancel, "Cancel", true);
             } else if (g_ui.oauth_code_mode) {
                 bool grok = oauth_provider_kind(g_ui.oauth_session.provider) == "grok";
@@ -2622,7 +2700,7 @@ void draw_panel() {
                     aa_round_rect(g_ui.settings_toggle[slot], 12, enabled[slot] ? color(48, 209, 88) : color(58, 58, 62), enabled[slot] ? color(48, 209, 88) : color(58, 58, 62));
                     fill_round({g_ui.settings_toggle[slot].x + (enabled[slot] ? 18.0f : 4.0f), y + 16, 16, 16}, 8, 245, 245, 247);
                     g_ui.settings_action[slot] = {card_x + 198, y + 10, 52, 28};
-                    button(g_ui.settings_action[slot], states[slot].logged_in ? "Out" : (kind_of(slot) == 2 ? "Key" : "In"), !states[slot].busy);
+                    button(g_ui.settings_action[slot], states[slot].logged_in ? "Out" : (kind_of(slot) == 2 || kind_of(slot) == 5 ? "Key" : "In"), !states[slot].busy);
                     if (add && states[slot].logged_in) {
                         g_ui.settings_add[kind_of(slot)] = {card_x + 256, y + 10, 30, 28};
                         button_styled(g_ui.settings_add[kind_of(slot)], "+", true, color(88, 220, 130), false);
@@ -3238,8 +3316,16 @@ void end_card_drag(int index) {
     sync_card_windows();
 }
 
+bool handle_schedule_click(int index, float x, float y) {
+    if (!g_ui.schedule_input || g_ui.schedule_slot != index) return false;
+    if (contains(g_ui.schedule_ok, x, y)) { if (!g_ui.schedule_text.empty()) submit_schedule_input(); }
+    else if (contains(g_ui.schedule_cancel, x, y)) close_schedule_input();
+    return true;
+}
+
 void handle_card_mouse_down(int index, float x, float y) {
     if (index < 0 || index >= kProviderCount) return;
+    if (handle_schedule_click(index, x, y)) return;
     if (!g_ui.meter_pinned[index] && contains(g_ui.card_warm_button[index], x, y)) { warm_async_for(index); return; }
     SDL_CaptureMouse(true);
     if (g_ui.meter_pinned[index]) {
@@ -3281,6 +3367,7 @@ void handle_card_mouse_up(int index) {
 
 void handle_meter_card_mouse_down(int index, float x, float y) {
     if (index < 0 || index >= kProviderCount || !g_ui.meter_card_open[index]) return;
+    if (handle_schedule_click(index, x, y)) return;
     if (contains(g_ui.card_warm_button[index], x, y)) { warm_async_for(index); return; }
     SDL_CaptureMouse(true);
     if (contains(g_ui.card_pin_button[index], x, y)) {
@@ -3778,8 +3865,11 @@ void logout_provider(int index) {
     state.status = "Logged out";
     state.primary_used = 0;
     state.secondary_used = 0;
+    state.tertiary_used = 0;
     state.primary_reset = 0;
     state.secondary_reset = 0;
+    state.tertiary_reset = 0;
+    state.tertiary_shown = false;
     state.reset_refresh_attempted_at = 0;
     state.last_refresh_ms = 0;
     if (index >= kKindCount) {
@@ -3962,9 +4052,9 @@ void handle_click(float x, float y) {
         if (contains(g_ui.api_input, x, y)) {
             g_ui.api_input_focused = true;
             SDL_StartTextInput(g_ui.window);
-        } else if (contains(g_ui.api_ok, x, y)) save_glm_key();
+        } else if (contains(g_ui.api_ok, x, y)) save_api_key();
+        else if (contains(g_ui.api_browser, x, y)) start_opencode_device_login();
         else if (contains(g_ui.api_cancel, x, y)) {
-            g_ui.schedule_input = false;
             g_ui.api_key_mode = false;
             g_ui.api_input_focused = false;
             set_target_height(wanted_panel_height());
@@ -4170,6 +4260,7 @@ void handle_mouse_down(float x, float y) {
     }
     if (g_ui.update_dialog_open) {
         if (over_click_target(x, y)) handle_click(x, y);
+        else if (!g_ui.update_installing) finish_update_dialog(false);
         g_ui.click_armed = true;
         return;
     }
@@ -4408,6 +4499,7 @@ void load_layout() {
             if (auto acct = json_number(*raw, "sa" + std::to_string(i))) g_app.slot_acct[i] = static_cast<int>(*acct);
         }
     }
+    if (auto kind5 = json_number(*raw, "sk5"); kind5 && *kind5 != 5) g_app.enabled[5] = false;
     if (!any) {
         for (int i = 0; i < 3; ++i) {
             std::string key = "tab" + std::to_string(i);
@@ -4422,7 +4514,7 @@ void init_state() {
     for (int kind = 0; kind < kKindCount; ++kind) {
         for (int acct = 1; acct <= 4; ++acct) {
             std::string store = std::string(kind_key(kind)) + "_" + std::to_string(acct);
-            bool has = kind == 2 ? load_api_key_provider(store).has_value() : load_credentials_provider(store).has_value();
+            bool has = kind == 2 || kind == 5 ? load_api_key_provider(store).has_value() || load_credentials_provider(store).has_value() : load_credentials_provider(store).has_value();
             if (!has) continue;
             bool exists = false;
             for (int i = 0; i < kMaxSlots; ++i) if (kind_of(i) == kind && acct_of(i) == acct) exists = true;
@@ -4437,11 +4529,16 @@ void init_state() {
         state.status = state.logged_in ? "Ready to refresh " + std::string(provider_label(i)) : "Not logged in";
         state.primary_row = primary_row_label(i);
         state.secondary_row = secondary_row_label(i);
+        state.tertiary_row = tertiary_row_label(i);
         state.secondary_available = kind_of(i) != 4;
         if (kind_of(i) == 2) {
             state.status = state.logged_in ? "Ready to refresh GLM" : "No GLM API key saved";
             state.account = state.logged_in ? "GLM API key" : "";
             state.account_label = state.logged_in ? "GLM" : "";
+        } else if (kind_of(i) == 5) {
+            state.status = state.logged_in ? "Ready to refresh OpenCode Go" : "No OpenCode Go credentials saved";
+            state.account = state.logged_in ? "OpenCode Go" : "";
+            state.account_label = state.logged_in ? "Go" : "";
         } else if (state.logged_in) {
             state.account = provider_label(i);
             state.account_label = provider_label(i);
@@ -4605,6 +4702,14 @@ int main(int argc, char** argv) {
                 update_render_metrics();
                 update_window_shape();
             }
+            else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.schedule_input) { g_ui.schedule_text += event.text.text; g_ui.schedule_error.clear(); }
+            else if (event.type == SDL_EVENT_KEY_DOWN && g_ui.schedule_input) {
+                bool paste = ((event.key.mod & SDL_KMOD_CTRL) && event.key.key == SDLK_V) || ((event.key.mod & SDL_KMOD_SHIFT) && event.key.key == SDLK_INSERT);
+                if (event.key.key == SDLK_ESCAPE) close_schedule_input();
+                else if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) { if (!g_ui.schedule_text.empty()) submit_schedule_input(); }
+                else if (event.key.key == SDLK_BACKSPACE && !g_ui.schedule_text.empty()) g_ui.schedule_text.pop_back();
+                else if (paste) { char* clip = SDL_GetClipboardText(); if (clip) { g_ui.schedule_text += trim_copy(clip); SDL_free(clip); } }
+            }
             else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.api_key_mode && g_ui.api_input_focused) g_ui.api_key_input += event.text.text;
             else if (event.type == SDL_EVENT_TEXT_INPUT && g_ui.oauth_code_mode && g_ui.oauth_code_input_focused) g_ui.oauth_code_input += event.text.text;
             else if (event.type == SDL_EVENT_KEY_DOWN) {
@@ -4629,12 +4734,11 @@ int main(int argc, char** argv) {
                     else if (event.key.key == SDLK_BACKSPACE && !oauth_code && !g_ui.api_key_input.empty() && g_ui.api_input_focused) g_ui.api_key_input.pop_back();
                     else if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
                         if (oauth_code) save_oauth_code();
-                        else save_glm_key();
+                        else save_api_key();
                     }
                     else if (event.key.key == SDLK_ESCAPE) {
                         if (oauth_code) cancel_oauth_code_login();
                         else {
-                            g_ui.schedule_input = false;
                             g_ui.api_key_mode = false;
                             g_ui.api_input_focused = false;
                             set_target_height(wanted_panel_height());

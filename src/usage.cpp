@@ -51,6 +51,7 @@ static constexpr const char* kGeminiQuotaSummaryUrls[] = {
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
     "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
 };
+static constexpr const char* kOpenCodeUsageUrl = "https://opencode.ai/zen/go/v1/usage";
 static constexpr const char* kGrokBillingUrl = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 static constexpr const char* kGrokSettingsUrl = "https://cli-chat-proxy.grok.com/v1/settings";
 static constexpr const char* kGrokChatUrl = "https://cli-chat-proxy.grok.com/v1/chat/completions";
@@ -213,6 +214,17 @@ static UsageInfo parse_usage(const std::string& body) {
     info.secondary = parse_openai_window(rate_limit, "secondary_window");
     if (!info.secondary.available) info.secondary = parse_openai_window(rate_limit, "secondary");
     return info;
+}
+
+static RateWindow parse_opencode_window(const std::string& body, const char* key, long long window_seconds) {
+    std::string object = object_for_key(body, key);
+    if (object.empty()) return {};
+    RateWindow window;
+    window.available = true;
+    window.used_percent = json_number(object, "percent").value_or(0);
+    window.reset_at = parse_iso_or_epoch_reset(json_string(object, "resetsAt").value_or(""));
+    window.limit_window_seconds = window_seconds;
+    return window;
 }
 
 static std::string request_id() {
@@ -550,6 +562,42 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         if (!info.primary.available) info.primary = parse_glm_window(res.body, "TOKENS_LIMIT");
         info.secondary = parse_glm_window(res.body, "TIME_LIMIT");
         info.tertiary = parse_glm_window(res.body, "TOKENS_LIMIT", 6);
+        return info;
+    }
+    if (kind == "opencode") {
+        std::map<std::string, std::string> headers;
+        auto credentials = load_credentials_provider(provider);
+        if (credentials) {
+            if (credentials_expired(*credentials)) {
+                std::string org = credentials->account_id;
+                credentials = oauth_refresh_provider(provider, credentials->refresh);
+                if (credentials->account_id.empty()) credentials->account_id = org;
+                save_credentials_provider(provider, *credentials);
+            }
+            headers["Authorization"] = "Bearer " + credentials->access;
+            if (!credentials->account_id.empty()) headers["x-opencode-org-id"] = credentials->account_id;
+        } else {
+            auto api_key = load_api_key_provider(provider);
+            if (!api_key) throw std::runtime_error("No OpenCode Go credentials saved");
+            headers["Authorization"] = auth_header_value(*api_key);
+        }
+        HttpResponse res = http_get(kOpenCodeUsageUrl, headers);
+        diagnostics_log("opencode usage status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()));
+        diagnostics_log_raw("opencode usage raw_body", res.body);
+        if (res.status < 200 || res.status >= 300) {
+            throw std::runtime_error("OpenCode Go usage request failed: HTTP " + std::to_string(res.status));
+        }
+        std::string usage = object_for_key(res.body, "usage");
+        if (usage.empty()) usage = res.body;
+        UsageInfo info;
+        info.email = "OpenCode Go";
+        info.plan_type = "Go";
+        info.primary = parse_opencode_window(usage, "rolling", 5 * 60 * 60);
+        info.secondary = parse_opencode_window(usage, "weekly", 7 * 24 * 60 * 60);
+        info.tertiary = parse_opencode_window(usage, "monthly", 30 * 24 * 60 * 60);
+        if (!info.primary.available && !info.secondary.available && !info.tertiary.available) {
+            throw std::runtime_error("OpenCode Go usage response contained no windows");
+        }
         return info;
     }
     auto credentials = load_credentials_provider(provider);
