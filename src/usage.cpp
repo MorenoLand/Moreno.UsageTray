@@ -52,6 +52,7 @@ static constexpr const char* kGeminiQuotaSummaryUrls[] = {
     "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
 };
 static constexpr const char* kOpenCodeUsageUrl = "https://opencode.ai/zen/go/v1/usage";
+static constexpr const char* kOpenCodeChatUrl = "https://opencode.ai/inference/go/openai/v1/chat/completions";
 static constexpr const char* kGrokBillingUrl = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 static constexpr const char* kGrokSettingsUrl = "https://cli-chat-proxy.grok.com/v1/settings";
 static constexpr const char* kGrokChatUrl = "https://cli-chat-proxy.grok.com/v1/chat/completions";
@@ -246,6 +247,24 @@ static std::string auth_header_value(const std::string& api_key) {
     std::string lower = key.substr(0, std::min<std::size_t>(7, key.size()));
     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return lower == "bearer " ? key : "Bearer " + key;
+}
+
+static std::map<std::string, std::string> opencode_headers(const std::string& provider) {
+    auto credentials = load_credentials_provider(provider);
+    if (credentials) {
+        if (credentials_expired(*credentials)) {
+            std::string org = credentials->account_id;
+            credentials = oauth_refresh_provider(provider, credentials->refresh);
+            if (credentials->account_id.empty()) credentials->account_id = org;
+            save_credentials_provider(provider, *credentials);
+        }
+        std::map<std::string, std::string> headers = {{"Authorization", "Bearer " + credentials->access}};
+        if (!credentials->account_id.empty()) headers["x-opencode-org-id"] = credentials->account_id;
+        return headers;
+    }
+    auto api_key = load_api_key_provider(provider);
+    if (!api_key) throw std::runtime_error("No OpenCode Go credentials saved");
+    return {{"Authorization", auth_header_value(*api_key)}};
 }
 
 static std::string object_for_type(const std::string& body, const std::string& type) {
@@ -565,23 +584,7 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
         return info;
     }
     if (kind == "opencode") {
-        std::map<std::string, std::string> headers;
-        auto credentials = load_credentials_provider(provider);
-        if (credentials) {
-            if (credentials_expired(*credentials)) {
-                std::string org = credentials->account_id;
-                credentials = oauth_refresh_provider(provider, credentials->refresh);
-                if (credentials->account_id.empty()) credentials->account_id = org;
-                save_credentials_provider(provider, *credentials);
-            }
-            headers["Authorization"] = "Bearer " + credentials->access;
-            if (!credentials->account_id.empty()) headers["x-opencode-org-id"] = credentials->account_id;
-        } else {
-            auto api_key = load_api_key_provider(provider);
-            if (!api_key) throw std::runtime_error("No OpenCode Go credentials saved");
-            headers["Authorization"] = auth_header_value(*api_key);
-        }
-        HttpResponse res = http_get(kOpenCodeUsageUrl, headers);
+        HttpResponse res = http_get(kOpenCodeUsageUrl, opencode_headers(provider));
         diagnostics_log("opencode usage status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()));
         diagnostics_log_raw("opencode usage raw_body", res.body);
         if (res.status < 200 || res.status >= 300) {
@@ -726,7 +729,20 @@ UsageInfo fetch_usage_with_auth_provider(const std::string& provider) {
 
 void warm_provider(const std::string& provider) {
     std::string kind = oauth_provider_kind(provider);
-    if (kind != "openai" && kind != "anthropic" && kind != "glm") throw std::runtime_error("Gemini warm-up is unavailable: no verified Antigravity generation endpoint");
+    if (kind != "openai" && kind != "anthropic" && kind != "glm" && kind != "opencode") throw std::runtime_error("Warm-up is unavailable for this provider");
+    if (kind == "opencode") {
+        std::string body = R"({"model":"mimo-v2.6-flash","max_tokens":1,"messages":[{"role":"user","content":"."}]})";
+        std::map<std::string, std::string> headers = opencode_headers(provider);
+        headers["x-opencode-session"] = request_id();
+        HttpResponse res = http_post_json(kOpenCodeChatUrl, body, headers);
+        diagnostics_log("opencode warm status=" + std::to_string(res.status) + " body_length=" + std::to_string(res.body.size()));
+        diagnostics_log_raw("opencode warm raw_body", res.body);
+        if (res.status < 200 || res.status >= 300) {
+            std::string message = json_string(object_for_key(res.body, "error"), "message").value_or("");
+            throw std::runtime_error("OpenCode Go warm request failed: HTTP " + std::to_string(res.status) + (message.empty() ? "" : " - " + message));
+        }
+        return;
+    }
     if (kind == "glm") {
         auto api_key = load_api_key_provider(provider);
         if (!api_key) throw std::runtime_error("No GLM API key saved");

@@ -1843,7 +1843,7 @@ std::string warm_schedule_label(const ProviderState& state) {
 
 bool warm_eligible(int index, const ProviderState& state) {
     int kind = kind_of(index);
-    return state.primary_available && (kind == 1 || state.primary_row == "5 hour") && kind >= 0 && kind <= 3;
+    return state.primary_available && (kind == 1 || state.primary_row == "5 hour") && ((kind >= 0 && kind <= 3) || kind == 5);
 }
 
 void set_warm_at(int index, long long at_ms) {
