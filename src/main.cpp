@@ -679,6 +679,10 @@ double display_percent(double used) {
     return std::clamp(value, 0.0, 100.0);
 }
 bool session_inactive(int index, double used, long long reset) { return kind_of(index) >= 0 && kind_of(index) <= 3 && (reset <= now_ms() / 1000 || (kind_of(index) == 3 && used <= 0.0)); }
+bool auto_warm_session_inactive(int index, double used, long long reset, long long now_seconds) {
+    int kind = kind_of(index);
+    return (kind >= 0 && kind <= 3 && (reset <= now_seconds || (kind == 3 && used <= 0.0))) || (kind == 5 && reset > 0 && reset <= now_seconds);
+}
 
 int callout_height_for(const ProviderState& state) {
     if (state.tertiary_shown) return kCalloutThirdRowHeight;
@@ -1671,12 +1675,12 @@ void begin_oauth_code_login(int index) {
     }
 }
 
-void warm_async_for(int provider_index) {
+bool warm_async_for(int provider_index) {
     unsigned long long operation_id;
     {
         std::lock_guard<std::mutex> lock(g_app.mutex);
         auto& state = g_app.providers[provider_index];
-        if (state.busy || !state.logged_in) return;
+        if (state.busy || !state.logged_in) return false;
         operation_id = ++state.operation_id;
         state.busy = true;
         state.status = "Warming " + std::string(provider_label(provider_index)) + "...";
@@ -1714,6 +1718,7 @@ void warm_async_for(int provider_index) {
             state.warm_error = e.what();
         }
     }).detach();
+    return true;
 }
 
 void login_async_for(int provider_index) {
@@ -1851,6 +1856,8 @@ void set_warm_at(int index, long long at_ms) {
     g_app.providers[index].warm_at_ms = at_ms;
 }
 
+void save_layout();
+
 void open_schedule_input(SDL_Window* window, int index) {
     g_ui.schedule_input = true;
     g_ui.schedule_slot = index;
@@ -1930,7 +1937,16 @@ void open_warm_menu(SDL_Window* window, int index) {
         else warm_async_for(index);
         break;
     }
-    case 7: { std::lock_guard<std::mutex> lock(g_app.mutex); g_app.providers[index].warm_auto = !g_app.providers[index].warm_auto; break; }
+    case 7: {
+        {
+            std::lock_guard<std::mutex> lock(g_app.mutex);
+            auto& state = g_app.providers[index];
+            state.warm_auto = !state.warm_auto;
+            if (state.warm_auto) state.warm_auto_last_ms = 0;
+        }
+        save_layout();
+        break;
+    }
     case 8: set_warm_at(index, 0); break;
     default: break;
     }
@@ -1944,21 +1960,22 @@ void tick_warm_schedules() {
     int slot = g_ui.schedule_slot;
     if (g_ui.schedule_input && (slot < 0 || (!g_ui.card_window_visible[slot] && !g_ui.meter_card_window_visible[slot]))) close_schedule_input();
     for (int i = 0; i < kProviderCount; ++i) {
-        bool fire = false;
+        bool scheduled_due = false, auto_due = false;
+        long long scheduled_at = 0;
         {
             std::lock_guard<std::mutex> lock(g_app.mutex);
             auto& state = g_app.providers[i];
             if (!state.logged_in || state.busy) continue;
-            if (state.warm_at_ms > 0 && now >= state.warm_at_ms) {
-                state.warm_at_ms = 0;
-                fire = true;
-            } else if (state.warm_auto && state.last_refresh_ms > 0 && warm_eligible(i, state) && now - state.warm_auto_last_ms >= 10 * 60 * 1000 &&
-                       session_inactive(i, state.primary_used, state.primary_reset)) {
-                state.warm_auto_last_ms = now;
-                fire = true;
-            }
+            scheduled_at = state.warm_at_ms;
+            scheduled_due = scheduled_at > 0 && now >= scheduled_at;
+            auto_due = state.warm_auto && state.last_refresh_ms > 0 && warm_eligible(i, state) && (state.warm_auto_last_ms == 0 || now - state.warm_auto_last_ms >= 10 * 60 * 1000) &&
+                       auto_warm_session_inactive(i, state.primary_used, state.primary_reset, now / 1000);
         }
-        if (fire) warm_async_for(i);
+        if (!(scheduled_due || auto_due) || !warm_async_for(i)) continue;
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        auto& state = g_app.providers[i];
+        if (scheduled_due && state.warm_at_ms == scheduled_at) state.warm_at_ms = 0;
+        if (auto_due && state.warm_auto) state.warm_auto_last_ms = now;
     }
 }
 
@@ -3690,6 +3707,7 @@ void save_layout() {
             json += ",\"sk" + std::to_string(i) + "\":" + std::to_string(g_app.slot_kind[i]);
             json += ",\"sa" + std::to_string(i) + "\":" + std::to_string(g_app.slot_acct[i]);
             json += ",\"o" + std::to_string(i) + "\":" + std::to_string(g_app.dock_order[i]);
+            json += ",\"wa" + std::to_string(i) + "\":" + (g_app.providers[i].warm_auto ? "1" : "0");
         }
     }
     json += ",\"remain\":" + std::string(g_ui.show_remaining ? "1" : "0");
@@ -4494,6 +4512,7 @@ void load_layout() {
             int value = static_cast<int>(*order);
             if (value >= 0 && value < kProviderCount) g_app.dock_order[i] = value;
         }
+        if (auto warm_auto = json_number(*raw, "wa" + std::to_string(i))) g_app.providers[i].warm_auto = *warm_auto != 0;
         if (i >= kKindCount) {
             if (auto kind = json_number(*raw, "sk" + std::to_string(i))) g_app.slot_kind[i] = static_cast<int>(*kind);
             if (auto acct = json_number(*raw, "sa" + std::to_string(i))) g_app.slot_acct[i] = static_cast<int>(*acct);
